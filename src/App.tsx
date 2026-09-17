@@ -1,5 +1,13 @@
 import { createContext, useContext, useState, useEffect, useRef } from "react";
 import { dbGet, dbSet } from "./db";
+import {
+  getToken, setToken, ApiError, apiLogin, apiSignup, apiGoogle, apiLogout,
+  apiMe, apiChangePassword, apiUpdateProfile, apiListBrands, apiCreateBrand,
+  apiUpdateBrand, apiDeleteBrand, apiListContent, apiCreateContent,
+  apiUpdateContent, apiDeleteContent, apiListTeam, apiListAllBrands,
+  apiGrant, apiRevoke, apiSetRole,
+  type ServerUser, type TeamUser,
+} from "./api";
 import { proxyPublish, shouldUseProxy } from "./utils/proxy";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { validate, emailRule, passwordRule, validatePasswordMatch } from "./utils/validation";
@@ -193,6 +201,20 @@ interface ContentItem {
 interface AuthUser {
   id: string; email: string; name: string;
   avatarColor: string; role: string; createdAt: string;
+  seesAll: boolean; brandIds: number[];
+}
+
+function toAuthUser(su: ServerUser): AuthUser {
+  return {
+    id: su.id, email: su.email, name: su.name,
+    avatarColor: su.avatarColor, role: su.role, createdAt: su.createdAt,
+    seesAll: su.seesAll, brandIds: su.brandIds,
+  };
+}
+
+/** Legacy (pre-migration/offline) session shape lacks seesAll/brandIds — fill defaults. */
+function legacySession(u: Omit<AuthUser, "seesAll" | "brandIds">): AuthUser {
+  return { ...u, seesAll: false, brandIds: [] };
 }
 
 interface AuthCtxValue {
@@ -258,7 +280,10 @@ async function migrateHashIfNeeded(password: string, userId: string, storedHash:
   return hashPasswordPBKDF2(password, userId);
 }
 
-interface StoredUser extends AuthUser { pwHash: string }
+interface StoredUser {
+  id: string; email: string; name: string;
+  avatarColor: string; role: string; createdAt: string; pwHash: string;
+}
 
 function loadUsers(): StoredUser[] {
   try { return JSON.parse(localStorage.getItem("contentOS_users") || "[]"); } catch { return []; }
@@ -303,10 +328,29 @@ function seedMasterUser() {
 }
 
 function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<AuthUser | null>(() => { seedMasterUser(); return loadSession(); });
+  const [user, setUser] = useState<AuthUser | null>(() => {
+    seedMasterUser();
+    const s = loadSession() as (AuthUser & { seesAll?: boolean; brandIds?: number[] }) | null;
+    // Sessions cached before the relational switch lack the new fields.
+    return s ? { ...s, seesAll: s.seesAll ?? false, brandIds: s.brandIds ?? [] } : s;
+  });
 
-  // On mount: pull users from DB → merge into localStorage so cross-device login works
+  // On mount: with a token, refresh identity from the server (role, seesAll,
+  // memberships). Without one, keep the legacy KV merge (offline / pre-login).
   useEffect(() => {
+    const token = getToken();
+    if (token) {
+      apiMe(token).then(({ user: su }) => {
+        const sessionUser = toAuthUser(su);
+        setUser(sessionUser); saveSession(sessionUser);
+      }).catch(e => {
+        if (e instanceof ApiError && e.status === 401) {
+          setToken(null); setUser(null); saveSession(null);
+        }
+        // Network error: keep the cached session; data layer falls back to KV.
+      });
+      return;
+    }
     dbGet<StoredUser[]>("contentOS:users").then(remote => {
       if (!remote || remote.length === 0) {
         // First time: push local users (including master) to DB
@@ -339,7 +383,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  const signIn = async (email: string, password: string): Promise<string | null> => {
+  const legacySignIn = async (email: string, password: string): Promise<string | null> => {
     let users = loadUsers();
     let found = users.find(u => u.email.toLowerCase() === email.toLowerCase());
     // If not in local cache, try fetching from DB (cross-device scenario)
@@ -360,11 +404,12 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
       saveUsers(users.map(u => u.id === found!.id ? found! : u));
     }
     const { pwHash: _, ...sessionUser } = found;
-    setUser(sessionUser); saveSession(sessionUser);
+    const s1 = legacySession(sessionUser);
+    setUser(s1); saveSession(s1);
     return null;
   };
 
-  const signUp = async (name: string, email: string, password: string): Promise<string | null> => {
+  const legacySignUp = async (name: string, email: string, password: string): Promise<string | null> => {
     const users = loadUsers();
     if (users.find(u => u.email.toLowerCase() === email.toLowerCase())) return "An account with that email already exists.";
     if (password.length < 8) return "Password must be at least 8 characters.";
@@ -374,11 +419,12 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     const newUser: StoredUser = { id, email, name, avatarColor, role: "Admin", createdAt: new Date().toISOString(), pwHash };
     saveUsers([...users, newUser]);
     const { pwHash: _, ...sessionUser } = newUser;
-    setUser(sessionUser); saveSession(sessionUser);
+    const s2 = legacySession(sessionUser);
+    setUser(s2); saveSession(s2);
     return null;
   };
 
-  const signInWithGoogle = async (credential: string): Promise<string | null> => {
+  const legacySignInWithGoogle = async (credential: string): Promise<string | null> => {
     try {
       const { sub, email, name } = decodeGoogleJwt(credential);
       const users = loadUsers();
@@ -391,16 +437,17 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
         found = newUser;
       }
       const { pwHash: _, ...sessionUser } = found;
-      setUser(sessionUser); saveSession(sessionUser);
+      const s3 = legacySession(sessionUser);
+      setUser(s3); saveSession(s3);
       return null;
     } catch {
       return "Google sign-in failed. Please try again.";
     }
   };
 
-  const signOut = () => { setUser(null); saveSession(null); };
+  const legacySignOut = () => { setUser(null); saveSession(null); };
 
-  const updateProfile = (patch: Partial<Pick<AuthUser, "name" | "avatarColor" | "role">>) => {
+  const legacyUpdateProfile = (patch: Partial<Pick<AuthUser, "name" | "avatarColor" | "role">>) => {
     if (!user) return;
     const updated = { ...user, ...patch };
     setUser(updated); saveSession(updated);
@@ -408,7 +455,7 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     saveUsers(users.map(u => u.id === user.id ? { ...u, ...patch } : u));
   };
 
-  const changePassword = async (current: string, next: string): Promise<string | null> => {
+  const legacyChangePassword = async (current: string, next: string): Promise<string | null> => {
     if (!user) return "Not signed in.";
     const users = loadUsers();
     const stored = users.find(u => u.id === user.id);
@@ -418,6 +465,78 @@ function AuthProvider({ children }: { children: React.ReactNode }) {
     const newHash = await hashPasswordPBKDF2(next, user.id);
     saveUsers(users.map(u => u.id === user.id ? { ...u, pwHash: newHash } : u));
     return null;
+  };
+
+  // ── Server-first auth (local PHP API). Legacy local auth runs only when
+  // the API is unreachable (offline / Apache stopped).
+  const signIn = async (email: string, password: string): Promise<string | null> => {
+    try {
+      const { user: su, token: tk } = await apiLogin(email, password);
+      setToken(tk);
+      const s = toAuthUser(su);
+      setUser(s); saveSession(s);
+      return null;
+    } catch (e) {
+      if (e instanceof ApiError && e.isNetwork) return legacySignIn(email, password);
+      return e instanceof ApiError ? e.message : "Sign-in failed.";
+    }
+  };
+
+  const signUp = async (name: string, email: string, password: string): Promise<string | null> => {
+    try {
+      const { user: su, token: tk } = await apiSignup(name, email, password);
+      setToken(tk);
+      const s = toAuthUser(su);
+      setUser(s); saveSession(s);
+      return null;
+    } catch (e) {
+      if (e instanceof ApiError && e.isNetwork) return legacySignUp(name, email, password);
+      return e instanceof ApiError ? e.message : "Sign-up failed.";
+    }
+  };
+
+  const signInWithGoogle = async (credential: string): Promise<string | null> => {
+    try {
+      const { user: su, token: tk } = await apiGoogle(credential);
+      setToken(tk);
+      const s = toAuthUser(su);
+      setUser(s); saveSession(s);
+      return null;
+    } catch (e) {
+      if (e instanceof ApiError && e.isNetwork) return legacySignInWithGoogle(credential);
+      return e instanceof ApiError ? e.message : "Google sign-in failed.";
+    }
+  };
+
+  const signOut = () => {
+    const token = getToken();
+    if (token) apiLogout(token).catch(() => {});
+    setToken(null);
+    legacySignOut();
+  };
+
+  const updateProfile = (patch: Partial<Pick<AuthUser, "name" | "avatarColor" | "role">>) => {
+    if (!user) return;
+    const token = getToken();
+    if (!token) { legacyUpdateProfile(patch); return; }
+    apiUpdateProfile(token, patch).then(({ user: su }) => {
+      const s = toAuthUser(su);
+      setUser(s); saveSession(s);
+    }).catch(e => {
+      if (e instanceof ApiError && e.isNetwork) legacyUpdateProfile(patch);
+    });
+  };
+
+  const changePassword = async (current: string, next: string): Promise<string | null> => {
+    const token = getToken();
+    if (!token) return legacyChangePassword(current, next);
+    try {
+      await apiChangePassword(token, current, next);
+      return null;
+    } catch (e) {
+      if (e instanceof ApiError && e.isNetwork) return legacyChangePassword(current, next);
+      return e instanceof ApiError ? e.message : "Password change failed.";
+    }
   };
 
   return <AuthCtx.Provider value={{ user, signIn, signUp, signInWithGoogle, signOut, updateProfile, changePassword }}>{children}</AuthCtx.Provider>;
@@ -4673,7 +4792,11 @@ function ProfilePanel({ open, onClose }: { open: boolean; onClose: () => void })
 
   const handleSaveProfile = () => {
     if (!name.trim()) { setError("Name cannot be empty."); return; }
-    updateProfile({ name: name.trim(), avatarColor, role });
+    // Roles are assigned by a super admin (Team view); the server rejects
+    // role changes from anyone else.
+    updateProfile(user.seesAll
+      ? { name: name.trim(), avatarColor, role }
+      : { name: name.trim(), avatarColor });
     setSuccess("Profile updated."); setError(null);
     setTimeout(() => setSuccess(null), 2500);
   };
@@ -4742,11 +4865,12 @@ function ProfilePanel({ open, onClose }: { open: boolean; onClose: () => void })
             </div>
             <div>
               <label className="block text-xs font-semibold mb-1.5" style={{ color: t.textSub }}>Role</label>
-              <select value={role} onChange={e => setRole(e.target.value)}
-                className="w-full text-sm px-3 py-2.5 rounded-lg border outline-none cursor-pointer"
+              <select value={role} onChange={e => setRole(e.target.value)} disabled={!user.seesAll}
+                className="w-full text-sm px-3 py-2.5 rounded-lg border outline-none cursor-pointer disabled:opacity-60"
                 style={{ background: t.inputBg, borderColor: t.border, color: t.text }}>
-                {["Admin","Editor","Viewer","Content Manager","Brand Manager"].map(r => <option key={r}>{r}</option>)}
+                {Array.from(new Set([...["Super Admin","Admin","Brand Manager","Content Manager","Editor","Business","Client","Viewer"], role])).map(r => <option key={r}>{r}</option>)}
               </select>
+              {!user.seesAll && <p className="text-xs mt-1" style={{ color: t.textMuted }}>Only a super admin can change roles.</p>}
             </div>
             <div>
               <label className="block text-xs font-semibold mb-2" style={{ color: t.textSub }}>Avatar Color</label>
@@ -4865,7 +4989,7 @@ function Sidebar({ view, setView, pendingCount, connectedCount, brands, onBrandC
         </div>
       </div>
       <nav className="flex-1 py-3 px-2">
-        {NAV_ITEMS.map(item => {
+        {(user?.seesAll ? [...NAV_ITEMS, { id:"team", label:"Team", icon:"◍" }] : NAV_ITEMS).map(item => {
           const isActive = view === item.id;
           return (
             <button key={item.id} onClick={() => setView(item.id)}
@@ -4953,6 +5077,148 @@ function Sidebar({ view, setView, pendingCount, connectedCount, brands, onBrandC
   );
 }
 
+// ─── Relational first-run: push browser cache/seeds into the API ─────────────
+// Runs once when the server holds no brands yet (fresh migration). The creator
+// automatically becomes owner-member of each pushed brand (server-side).
+
+function loadLocalBrands(): Brand[] {
+  try { const r = localStorage.getItem("contentOS_brands"); return r ? JSON.parse(r) : SEED_BRANDS; }
+  catch { return SEED_BRANDS; }
+}
+function loadLocalContent(): ContentItem[] {
+  try { const r = localStorage.getItem("contentOS_content"); return r ? JSON.parse(r) : SEED_CONTENT; }
+  catch { return SEED_CONTENT; }
+}
+
+async function pushLocalToApi(token: string): Promise<{ brands: Brand[]; content: ContentItem[] }> {
+  for (const b of loadLocalBrands()) {
+    const { id: _bid, ideas: _i, drafts: _d, review: _r, scheduled: _s, posts_month: _p, ...payload } = b;
+    try { await apiCreateBrand(token, payload); } catch { /* keep going */ }
+  }
+  const brands = (await apiListBrands(token).catch(() => [])) as unknown as Brand[];
+  for (const c of loadLocalContent()) {
+    const { id: _cid, ...payload } = c;
+    try { await apiCreateContent(token, payload as Record<string, unknown>); } catch { /* keep going */ }
+  }
+  const content = (await apiListContent(token).catch(() => [])) as unknown as ContentItem[];
+  return { brands, content };
+}
+
+// ─── Team & Access (super admin only) ─────────────────────────────────────────
+
+const TEAM_ROLES = ["Super Admin","Admin","Brand Manager","Content Manager","Editor","Business","Client","Viewer"];
+const MEMBER_ROLES = ["owner","editor","viewer"];
+
+function TeamGate() {
+  const { user } = useAuth();
+  if (!user?.seesAll) return null;
+  return <TeamView />;
+}
+
+function TeamView() {
+  const { t } = useTheme();
+  const [users, setUsers] = useState<TeamUser[]>([]);
+  const [brands, setBrands] = useState<{ id: number; name: string }[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [grantBrand, setGrantBrand] = useState<Record<string, string>>({});
+  const [grantRole, setGrantRole] = useState<Record<string, string>>({});
+
+  const reload = async () => {
+    const token = getToken();
+    if (!token) { setError("Not authenticated."); setLoading(false); return; }
+    try {
+      const [u, b] = await Promise.all([apiListTeam(token), apiListAllBrands(token)]);
+      setUsers(u); setBrands(b); setError(null);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Couldn't load team.");
+    } finally { setLoading(false); }
+  };
+
+  useEffect(() => { reload(); }, []);
+
+  const run = async (fn: (token: string) => Promise<unknown>, okMsg: string) => {
+    const token = getToken();
+    if (!token) { setError("Not authenticated."); return; }
+    try { await fn(token); setNotice(okMsg); setError(null); await reload(); }
+    catch (e) { setError(e instanceof ApiError ? e.message : "Request failed."); }
+  };
+
+  return (
+    <div className="p-6 lg:p-8 max-w-5xl mx-auto">
+      <SectionHeader title="Team & Access" sub="Business and client users only see brands granted to them below. Super admins always see everything." />
+      {error && <div className="text-sm px-4 py-3 rounded-xl border mb-4" style={{ background: t.dangerBg, borderColor: t.dangerBorder, color: t.danger }}>{error}</div>}
+      {notice && <div className="text-sm px-4 py-3 rounded-xl border mb-4" style={{ background: t.successBg, borderColor: t.success, color: t.success }}>{notice}</div>}
+      {loading ? (
+        <div className="text-sm" style={{ color: t.textMuted }}>Loading team…</div>
+      ) : (
+        <div className="space-y-4">
+          {users.map(u => (
+            <Card key={u.id} className="p-4">
+              <div className="flex items-center gap-3 flex-wrap">
+                <div className="w-9 h-9 rounded-xl flex items-center justify-center font-bold text-sm flex-shrink-0"
+                  style={{ background: u.avatarColor + "20", color: u.avatarColor }}>
+                  {u.name.slice(0, 1).toUpperCase()}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="font-semibold text-sm" style={{ color: t.text }}>{u.name}</div>
+                  <div className="text-xs" style={{ color: t.textMuted }}>{u.email}</div>
+                </div>
+                {u.seesAll ? (
+                  <span className="text-xs font-semibold px-2.5 py-1 rounded-full" style={{ background: t.navActive, color: t.navActiveText }}>Super Admin · all brands</span>
+                ) : (
+                  <select value={u.role} onChange={e => run(tk => apiSetRole(tk, u.id, e.target.value), `Role updated for ${u.name}`)}
+                    className="text-xs px-2.5 py-1.5 rounded-lg border outline-none cursor-pointer"
+                    style={{ background: t.inputBg, borderColor: t.border, color: t.text }}>
+                    {Array.from(new Set([...TEAM_ROLES, u.role])).map(r => <option key={r}>{r}</option>)}
+                  </select>
+                )}
+              </div>
+              {!u.seesAll && (
+                <div className="mt-3 pt-3 border-t" style={{ borderColor: t.borderLight }}>
+                  <div className="flex gap-2 flex-wrap mb-2">
+                    {u.brands.length === 0 && <span className="text-xs" style={{ color: t.textMuted }}>No brand access yet.</span>}
+                    {u.brands.map(b => (
+                      <span key={b.brandId} className="inline-flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-full font-medium"
+                        style={{ background: t.tagBg, color: t.textSub }}>
+                        {b.brandName} · {b.memberRole}
+                        <button onClick={() => run(tk => apiRevoke(tk, u.id, b.brandId), `Removed ${b.brandName} from ${u.name}`)}
+                          className="opacity-60 hover:opacity-100 font-bold" title="Revoke access">×</button>
+                      </span>
+                    ))}
+                  </div>
+                  <div className="flex gap-2 flex-wrap items-center">
+                    <select value={grantBrand[u.id] || ""} onChange={e => setGrantBrand(g => ({ ...g, [u.id]: e.target.value }))}
+                      className="text-xs px-2.5 py-1.5 rounded-lg border outline-none cursor-pointer"
+                      style={{ background: t.inputBg, borderColor: t.border, color: t.text }}>
+                      <option value="">Select brand…</option>
+                      {brands.filter(b => !u.brands.some(ub => ub.brandId === b.id)).map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                    </select>
+                    <select value={grantRole[u.id] || "owner"} onChange={e => setGrantRole(g => ({ ...g, [u.id]: e.target.value }))}
+                      className="text-xs px-2.5 py-1.5 rounded-lg border outline-none cursor-pointer"
+                      style={{ background: t.inputBg, borderColor: t.border, color: t.text }}>
+                      {MEMBER_ROLES.map(r => <option key={r}>{r}</option>)}
+                    </select>
+                    <button onClick={() => {
+                      const bid = Number(grantBrand[u.id] || 0);
+                      if (!bid) { setError("Pick a brand to grant."); return; }
+                      run(tk => apiGrant(tk, u.id, bid, grantRole[u.id] || "owner"), `Granted brand access to ${u.name}`);
+                    }}
+                      className="text-xs px-3 py-1.5 rounded-lg font-semibold" style={{ background: t.tagBg, color: t.textSub }}>
+                      Grant access
+                    </button>
+                  </div>
+                </div>
+              )}
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -4977,8 +5243,41 @@ export default function App() {
   const handleApiKeyChange = (k: string) => { setApiKey(k); localStorage.setItem("contentOS_apiKey", k); dbSet("contentOS:apiKey", k); };
   const handleModelChange  = (m: string) => { setAiModel(m); localStorage.setItem("contentOS_aiModel", m); dbSet("contentOS:aiModel", m); };
 
-  // ── Supabase sync on mount ──
+  // ── Data sync on mount ──
+  // With a token the relational API is the source of truth (scoped by
+  // membership). Without one, the legacy KV sync runs (offline / pre-login).
+  // Integrations + settings always stay on KV (global, tiny).
   useEffect(() => {
+    const token = getToken();
+    if (token) {
+      apiListBrands(token).then(async data => {
+        if (data.length > 0) {
+          const bs = data as unknown as Brand[];
+          setBrands(bs);
+          localStorage.setItem("contentOS_brands", JSON.stringify(bs));
+        } else {
+          // First run after migration: push local cache/seeds, then re-read.
+          try {
+            const pushed = await pushLocalToApi(token);
+            if (pushed.brands.length > 0) {
+              setBrands(pushed.brands);
+              localStorage.setItem("contentOS_brands", JSON.stringify(pushed.brands));
+            }
+            if (pushed.content.length > 0) {
+              setContent(pushed.content);
+              localStorage.setItem("contentOS_content", JSON.stringify(pushed.content));
+            }
+          } catch { /* offline: keep cached state */ }
+        }
+      }).catch(() => { /* offline: keep cached state */ });
+      apiListContent(token).then(data => {
+        if (data.length > 0) {
+          const cs = data as unknown as ContentItem[];
+          setContent(cs);
+          localStorage.setItem("contentOS_content", JSON.stringify(cs));
+        }
+      }).catch(() => { /* offline: keep cached state */ });
+    } else {
     // Brands
     dbGet<Brand[]>("contentOS:brands").then(data => {
       if (data && data.length > 0) {
@@ -5017,6 +5316,7 @@ export default function App() {
         if (data.googleClientId) localStorage.setItem("contentOS_googleClientId", data.googleClientId);
       }
     });
+    } // end legacy (no-token) KV sync
   }, []);
 
   // Integrations
@@ -5066,15 +5366,38 @@ export default function App() {
 
   const persistBrands = (next: Brand[]) => {
     localStorage.setItem("contentOS_brands", JSON.stringify(next));
-    dbSet("contentOS:brands", next);
+    // Token users persist via the relational API (per-item calls below);
+    // writing scoped subsets to the shared KV store would corrupt it.
+    if (!getToken()) dbSet("contentOS:brands", next);
   };
   const persistContent = (next: ContentItem[]) => {
     localStorage.setItem("contentOS_content", JSON.stringify(next));
-    dbSet("contentOS:content", next);
+    if (!getToken()) dbSet("contentOS:content", next);
   };
 
   // ── Brand CRUD ──
-  const handleSaveBrand = (data: Omit<Brand,"id"|"ideas"|"drafts"|"review"|"scheduled"|"posts_month">) => {
+  // With a token, writes go to the relational API (scoped server-side);
+  // otherwise the legacy local + KV path runs.
+  const apiErr = (e: unknown) => `Sync failed: ${e instanceof ApiError ? e.message : "network error"}`;
+
+  const handleSaveBrand = async (data: Omit<Brand,"id"|"ideas"|"drafts"|"review"|"scheduled"|"posts_month">) => {
+    const token = getToken();
+    if (token) {
+      try {
+        if (editBrandId) {
+          const updated = await apiUpdateBrand(token, editBrandId, data) as unknown as Brand;
+          setBrands(bs => { const next = bs.map(b => b.id === editBrandId ? updated : b); persistBrands(next); return next; });
+          showToast(`Brand "${data.name}" updated`);
+        } else {
+          const created = await apiCreateBrand(token, data) as unknown as Brand;
+          setBrands(bs => { const next = [...bs, created]; persistBrands(next); return next; });
+          showToast(`Brand "${data.name}" created`);
+        }
+      } catch (e) { showToast(apiErr(e)); return; }
+      setBrandFormOpen(false);
+      setEditBrandId(null);
+      return;
+    }
     if (editBrandId) {
       setBrands(bs => { const next = bs.map(b => b.id === editBrandId ? { ...b, ...data } : b); persistBrands(next); return next; });
       showToast(`Brand "${data.name}" updated`);
@@ -5086,8 +5409,13 @@ export default function App() {
     setBrandFormOpen(false);
     setEditBrandId(null);
   };
-  const handleDeleteBrand = (id: number) => {
+  const handleDeleteBrand = async (id: number) => {
     const b = brands.find(x => x.id === id);
+    const token = getToken();
+    if (token) {
+      try { await apiDeleteBrand(token, id); }
+      catch (e) { showToast(apiErr(e)); return; }
+    }
     setBrands(bs => { const next = bs.filter(x => x.id !== id); persistBrands(next); return next; });
     setContent(cs => { const next = cs.filter(c => c.brand !== b?.name); persistContent(next); return next; });
     setViewBrandId(null);
@@ -5095,7 +5423,27 @@ export default function App() {
   };
 
   // ── Content CRUD ──
-  const handleSaveContent = (data: Omit<ContentItem,"id"|"score">) => {
+  const handleSaveContent = async (data: Omit<ContentItem,"id"|"score">) => {
+    const token = getToken();
+    if (token) {
+      try {
+        if (editPostId && editPostId > 0) {
+          const updated = await apiUpdateContent(token, editPostId, data as unknown as Record<string, unknown>) as unknown as ContentItem;
+          setContent(cs => { const next = cs.map(c => c.id === editPostId ? updated : c); persistContent(next); return next; });
+          showToast("Post updated");
+        } else {
+          const created = await apiCreateContent(token, {
+            ...(data as unknown as Record<string, unknown>),
+            score: Math.floor(70 + Math.random() * 25),
+          }) as unknown as ContentItem;
+          setContent(cs => { const next = [created, ...cs]; persistContent(next); return next; });
+          showToast("Post created");
+        }
+      } catch (e) { showToast(apiErr(e)); return; }
+      setContentFormOpen(false);
+      setEditPostId(null);
+      return;
+    }
     if (editPostId && editPostId > 0) {
       setContent(cs => { const next = cs.map(c => c.id === editPostId ? { ...c, ...data } : c); persistContent(next); return next; });
       showToast("Post updated");
@@ -5107,16 +5455,42 @@ export default function App() {
     setContentFormOpen(false);
     setEditPostId(null);
   };
-  const handleDeleteContent = (id: number) => {
+  const handleDeleteContent = async (id: number) => {
+    const token = getToken();
     setContent(cs => { const next = cs.filter(c => c.id !== id); persistContent(next); return next; });
     setViewPostId(null);
     showToast("Post deleted");
+    if (token) {
+      try { await apiDeleteContent(token, id); }
+      catch (e) { showToast(apiErr(e)); }
+    }
   };
-  const handleStatusChange = (id: number, s: Status) => {
+  const handleStatusChange = async (id: number, s: Status) => {
     setContent(cs => { const next = cs.map(c => c.id === id ? { ...c, status: s } : c); persistContent(next); return next; });
     showToast(`Status → ${statusCfg(s, t).label}`);
+    const token = getToken();
+    if (token) {
+      try { await apiUpdateContent(token, id, { status: s }); }
+      catch (e) { showToast(apiErr(e)); }
+    }
   };
-  const handleAddMultipleContent = (items: Omit<ContentItem,"id"|"score">[]) => {
+  const handleAddMultipleContent = async (items: Omit<ContentItem,"id"|"score">[]) => {
+    const token = getToken();
+    if (token) {
+      try {
+        const created: ContentItem[] = [];
+        for (const item of items) {
+          const c = await apiCreateContent(token, {
+            ...(item as unknown as Record<string, unknown>),
+            score: Math.floor(Math.random() * 30) + 70,
+          }) as unknown as ContentItem;
+          created.push(c);
+        }
+        setContent(cs => { const next = [...cs, ...created]; persistContent(next); return next; });
+        showToast(`${items.length} posts added to calendar`);
+      } catch (e) { showToast(apiErr(e)); }
+      return;
+    }
     setContent(cs => {
       let nextId = cs.reduce((m, c) => Math.max(m, c.id), 0) + 1;
       const newItems = items.map(item => ({ ...item, id: nextId++, score: Math.floor(Math.random() * 30) + 70 }));
@@ -5170,6 +5544,7 @@ export default function App() {
               showToast={showToast}
             />
           )}
+          {view === "team" && <TeamGate />}
           </ErrorBoundary>
         </main>
 
@@ -5191,7 +5566,18 @@ export default function App() {
             onClose={() => setViewBrandId(null)}
             onEdit={() => { setEditBrandId(viewBrand.id); setViewBrandId(null); setBrandFormOpen(true); }}
             onDelete={() => { const id = viewBrand.id; setViewBrandId(null); const b = brands.find(x=>x.id===id); setConfirmDelete({ type:"brand", id, name: b?.name||"" }); }}
-            onChannelsSave={(channels) => setBrands(bs => { const next = bs.map(b => b.id === viewBrand.id ? { ...b, channels } : b); persistBrands(next); return next; })}
+            onChannelsSave={(channels) => {
+              const token = getToken();
+              const cur = brands.find(b => b.id === viewBrand.id);
+              if (token && cur) {
+                apiUpdateBrand(token, viewBrand.id, { ...cur, channels }).then(updated => {
+                  const ub = updated as unknown as Brand;
+                  setBrands(bs => { const next = bs.map(b => b.id === viewBrand.id ? ub : b); persistBrands(next); return next; });
+                }).catch(e => showToast(apiErr(e)));
+                return;
+              }
+              setBrands(bs => { const next = bs.map(b => b.id === viewBrand.id ? { ...b, channels } : b); persistBrands(next); return next; });
+            }}
           />
         )}
 
