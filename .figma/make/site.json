@@ -1,0 +1,10 @@
+{
+  "description": "Streamlines project management by enabling teams to track tasks, collaborate in real-time, and visualize progress through intuitive dashboards.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
