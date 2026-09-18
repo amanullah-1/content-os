@@ -2,7 +2,7 @@
 
 ContentOS is a multi-brand content operations app (brands, content pipeline, calendar, publishing integrations, analytics, team access control) built with **React 19 + Vite 8 + Tailwind CSS v4 + TypeScript** and a **PHP 8 + MySQL 8** backend.
 
-This guide takes you from `git clone` to running the app in your browser and developing further.
+This guide takes you from `git clone` to running the app locally in your browser and developing further.
 
 **Local stack at a glance**
 
