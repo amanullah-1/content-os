@@ -1,4 +1,8 @@
-const PROXY_BASE = import.meta.env.VITE_SUPABASE_PROXY_URL ||
+// Local PHP proxy (api/publish.php) takes precedence when configured,
+// otherwise falls back to the Supabase Edge Function.
+const PROXY_BASE =
+  import.meta.env.VITE_PUBLISH_PROXY_URL ||
+  import.meta.env.VITE_SUPABASE_PROXY_URL ||
   "https://rssvhitxlyfpysxqkwff.supabase.co/functions/v1/social-proxy";
 
 interface ProxyPayload {
@@ -34,7 +38,7 @@ export async function proxyPublish(payload: ProxyPayload): Promise<ProxyResult> 
   } catch (error) {
     return {
       success: false,
-      message: `Proxy unreachable: ${error instanceof Error ? error.message : "Network error"}. Check your Supabase edge function deployment.`,
+      message: `Proxy unreachable: ${error instanceof Error ? error.message : "Network error"}. Check your publish proxy (local PHP API or Supabase edge function).`,
     };
   }
 }

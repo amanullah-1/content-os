@@ -1,4 +1,8 @@
-const BASE = import.meta.env.VITE_SUPABASE_BASE_URL || "https://rssvhitxlyfpysxqkwff.supabase.co/functions/v1/make-server-76b9a4db";
+// Local MySQL (PHP API in /api) takes precedence when configured,
+// otherwise falls back to the Supabase Edge Function.
+const BASE =
+  import.meta.env.VITE_KV_BASE_URL ||
+  import.meta.env.VITE_SUPABASE_BASE_URL || "https://rssvhitxlyfpysxqkwff.supabase.co/functions/v1/make-server-76b9a4db";
 
 export async function dbGet<T>(key: string): Promise<T | null> {
   try {
