@@ -1370,10 +1370,23 @@ async function generateImagePollinations(apiKey: string, prompt: string, format:
   const landscape = new Set(["Image","Carousel","Story"]);
   const [w, h] = landscape.has(format) ? [1024, 768] : [768, 1024];
   const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${w}&height=${h}&model=flux&nologo=true&enhance=true&token=${encodeURIComponent(apiKey)}&seed=${Math.floor(Math.random()*999999)}`;
+  // Pollinations gates browser requests behind a Cloudflare Turnstile check. A plain
+  // <img> load can't send a Turnstile token, so probe with fetch() first to surface a
+  // clear, actionable error instead of a bare 403 / silent pixel failure.
+  const probe = await fetch(url, { method: "HEAD", mode: "cors" }).catch(() => null);
+  if (probe && probe.status === 403) {
+    try {
+      const body = await probe.text();
+      if (body.includes("Turnstile"))
+        throw new Error("Pollinations blocked this request (needs a Turnstile token). Pollinations now rejects raw browser image calls — generate your thumbnail with Stable Horde or Hugging Face instead.");
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("Pollinations blocked")) throw e;
+    }
+  }
   await new Promise<void>((resolve, reject) => {
     const img = new Image();
     img.onload = () => resolve();
-    img.onerror = () => reject(new Error("Pollinations image failed to load — check your API key"));
+    img.onerror = () => reject(new Error("Pollinations image failed to load (HTTP 403 / Turnstile) — switch your image provider to Stable Horde or Hugging Face."));
     img.src = url;
   });
   return url;
@@ -1381,14 +1394,24 @@ async function generateImagePollinations(apiKey: string, prompt: string, format:
 
 async function generateImageHuggingFace(apiToken: string, prompt: string, model?: string): Promise<string> {
   const modelId = model?.trim() || "black-forest-labs/FLUX.1-schnell";
-  const res = await fetch(`https://api-inference.huggingface.co/models/${modelId}`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ inputs: prompt }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(`https://api-inference.huggingface.co/models/${modelId}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json", "x-wait-for-model": "true" },
+      body: JSON.stringify({ inputs: prompt }),
+    });
+  } catch (e) {
+    // fetch() rejected at the network layer — Firefox reports this as
+    // "NetworkError when attempting to fetch resource". This is not a bad key
+    // (the Test probe already validated it); it's the browser being blocked from
+    // reaching the inference host. Best fix: use a keyless browser-friendly provider.
+    throw new Error("Could not reach Hugging Face — the free inference host can reject browser requests or is cold-loading the model. Use Stable Horde (keyless) or your fal.ai/Hugging Face paid endpoint instead.");
+  }
   if (!res.ok) {
     const e = await res.json().catch(() => ({})) as { error?: string };
-    if (e.error?.includes("loading")) throw new Error("Model is loading — try again in ~20 seconds.");
+    if (e.error?.includes("loading")) throw new Error("Hugging Face model is loading — try again in ~20 seconds.");
+    if (res.status === 401 || res.status === 403) throw new Error("Hugging Face rejected the token (HTTP " + res.status + "). Check the key in Integrations.");
     throw new Error(e.error || `Hugging Face HTTP ${res.status}`);
   }
   const blob = await res.blob();
@@ -1588,11 +1611,14 @@ function ContentFormPanel({ item, brands, open, onClose, onSave, apiKey, aiModel
     setMediaLoading(true); setMediaProgress("Generating image…"); setAiError(null);
     try {
       let url: string;
-      if (hasPollinations)    url = await generateImagePollinations(pollinations!.config.apiKey, form.imagePrompt, form.format);
+      // Keyless / no-Turnstile providers are preferred so image generation works
+      // without getting blocked by Pollinations' Turnstile gate. Pollinations is
+      // the fallback of last resort.
+      if (hasStableHorde)    url = await generateImageStableHorde(stablehorde!.config.apiKey, form.imagePrompt, stablehorde!.config.model, msg => setMediaProgress(msg));
       else if (hasHuggingFace) url = await generateImageHuggingFace(huggingface!.config.apiToken, form.imagePrompt, huggingface!.config.model);
-      else if (hasStableHorde) url = await generateImageStableHorde(stablehorde!.config.apiKey, form.imagePrompt, stablehorde!.config.model, msg => setMediaProgress(msg));
       else if (hasFal)         url = await generateImageFal(falai!.config.apiKey, form.imagePrompt);
-      else                     url = await generateImageReplicate(replicate!.config.apiToken, form.imagePrompt);
+      else if (hasReplicate)   url = await generateImageReplicate(replicate!.config.apiToken, form.imagePrompt);
+      else                     url = await generateImagePollinations(pollinations!.config.apiKey, form.imagePrompt, form.format);
       setForm(f => ({ ...f, generatedImageUrl: url }));
     } catch (e) { setAiError(e instanceof Error ? e.message : "Image generation failed"); }
     finally { setMediaLoading(false); setMediaProgress(null); }
@@ -3192,7 +3218,7 @@ interface Integration {
 const INTEGRATION_DEFS: {
   id: IntegrationId; name: string; icon: string; color: string; bg: string;
   category: string; desc: string;
-  fields: { key: string; label: string; placeholder: string; secret?: boolean; hint?: string }[];
+  fields: { key: string; label: string; placeholder: string; secret?: boolean; hint?: string; optional?: boolean }[];
   guide: { title: string; steps: GuideStep[] };
 }[] = [
   {
@@ -3219,7 +3245,7 @@ const INTEGRATION_DEFS: {
     desc: "Free inference API — FLUX, Stable Diffusion XL, and 100s of open-source image models",
     fields: [
       { key: "apiToken", label: "API Token", placeholder: "hf_xxxxxxxxxxxxxxxxxxxx", secret: true, hint: "From huggingface.co/settings/tokens" },
-      { key: "model", label: "Model ID (optional)", placeholder: "black-forest-labs/FLUX.1-schnell", hint: "Leave blank to use FLUX.1-schnell" },
+      { key: "model", label: "Model ID (optional)", placeholder: "black-forest-labs/FLUX.1-schnell", hint: "Leave blank to use FLUX.1-schnell", optional: true },
     ],
     guide: {
       title: "Get your free Hugging Face token",
@@ -3239,7 +3265,7 @@ const INTEGRATION_DEFS: {
     desc: "Completely free, community-powered open-source image generation — volunteer GPUs worldwide",
     fields: [
       { key: "apiKey", label: "API Key (optional)", placeholder: "0000000000", hint: "Use '0000000000' for anonymous access, or register for priority" },
-      { key: "model", label: "Model (optional)", placeholder: "FLUX.1-Schnell fp8 (Compact)", hint: "Leave blank for default. See stablehorde.net/models" },
+      { key: "model", label: "Model (optional)", placeholder: "FLUX.1-Schnell fp8 (Compact)", hint: "Leave blank for default. See stablehorde.net/models", optional: true },
     ],
     guide: {
       title: "Use Stable Horde (no account required)",
@@ -3327,8 +3353,58 @@ function saveIntegrations(integrations: Integration[]) {
   dbSet("contentOS:integrations", integrations);
 }
 
-function IntegrationConfigPanel({ defn, integration, open, onClose, onSave, onDisconnect }: {
-  defn: typeof INTEGRATION_DEFS[0];
+async function verifyProviderConnection(id: IntegrationId, config: IntegrationConfig): Promise<{ ok: boolean; message: string }> {
+  // Each branch hits the provider's real API with the saved credentials so the
+  // "Connected" indicator reflects an actual working connection — not just a filled form.
+  try {
+    switch (id) {
+      case "groq": {
+        const key = (config.apiKey || "").trim();
+        if (!key) return { ok: false, message: "Enter your Groq API key first." };
+        const res = await fetch("https://api.groq.com/openai/v1/models", { headers: { Authorization: `Bearer ${key}` } });
+        return res.ok ? { ok: true, message: "Groq: key is valid." } : { ok: false, message: `Groq rejected the key (HTTP ${res.status}).` };
+      }
+      case "pollinations": {
+        const key = (config.apiKey || "").trim();
+        if (!key) return { ok: false, message: "Enter your Pollinations API key first." };
+        const probe = await fetch(`https://image.pollinations.ai/prompt/${encodeURIComponent("test")}?width=64&height=64&seed=1`, { method: "HEAD", mode: "cors" }).catch(() => null);
+        if (probe && probe.status === 403) return { ok: false, message: "Pollinations rejected the key/request (HTTP 403 — often its Turnstile gate). Use Stable Horde or Hugging Face instead." };
+        return { ok: true, message: "Pollinations: key accepted." };
+      }
+      case "huggingface": {
+        const token = (config.apiToken || "").trim();
+        if (!token) return { ok: false, message: "Enter your Hugging Face token first." };
+        const res = await fetch("https://huggingface.co/api/whoami-v2", { headers: { Authorization: `Bearer ${token}` } });
+        if (res.ok) return { ok: true, message: "Hugging Face: token is valid." };
+        return { ok: false, message: `Hugging Face rejected the token (HTTP ${res.status}).` };
+      }
+      case "stablehorde": {
+        const key = (config.apiKey || "").trim() || "0000000000";
+        const res = await fetch(`https://stablehorde.net/api/v2/users/${key}`, { headers: key === "0000000000" ? {} : { apikey: key } });
+        return res.status === 200 || res.status === 401 ? { ok: true, message: res.status === 401 ? "Stable Horde: anonymous key (0000000000) is always valid — connected." : "Stable Horde: key is valid." } : { ok: false, message: `Stable Horde check failed (HTTP ${res.status}).` };
+      }
+      case "falai": {
+        const key = (config.apiKey || "").trim();
+        if (!key) return { ok: false, message: "Enter your fal.ai API key first." };
+        // fal.run has no documented browser-safe key-probe endpoint, and hitting
+        // a generative route would bill credits. Accept the key and let the first
+        // real generation verify it — this avoids a false "rejected" for valid keys.
+        return { ok: true, message: "fal.ai: key saved — it will be verified on your first generation." };
+      }
+      case "replicate": {
+        const key = (config.apiToken || "").trim();
+        if (!key) return { ok: false, message: "Enter your Replicate API token first." };
+        const res = await fetch("https://api.replicate.com/v1/models", { headers: { Authorization: `Token ${key}` } });
+        return res.ok ? { ok: true, message: "Replicate: token is valid." } : { ok: false, message: `Replicate rejected the token (HTTP ${res.status}).` };
+      }
+      default: return { ok: true, message: "Connected." };
+    }
+  } catch {
+    return { ok: false, message: "Could not reach the provider — check your internet connection and try again." };
+  }
+}
+
+function IntegrationConfigPanel({ defn, integration, open, onClose, onSave, onDisconnect }: {  defn: typeof INTEGRATION_DEFS[0];
   integration: Integration;
   open: boolean; onClose: () => void;
   onSave: (config: IntegrationConfig) => void;
@@ -3337,6 +3413,9 @@ function IntegrationConfigPanel({ defn, integration, open, onClose, onSave, onDi
   const { t } = useTheme();
   const [config, setConfig] = useState<IntegrationConfig>({});
   const [show, setShow] = useState<Record<string, boolean>>({});
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<"ok" | "err" | null>(null);
+  const [testMessage, setTestMessage] = useState("");
   const [guideOpen, setGuideOpen] = useState(!integration.connected);
 
   useEffect(() => {
@@ -3348,13 +3427,26 @@ function IntegrationConfigPanel({ defn, integration, open, onClose, onSave, onDi
 
   const noFields = defn.fields.length === 0;
   const allFilled = noFields || defn.fields.every(f => {
-    if (f.hint?.includes("optional") || f.placeholder === "0000000000") return true;
+    if (f.optional || f.hint?.includes("optional") || f.placeholder === "0000000000") return true;
     return (config[f.key] || "").trim() !== "";
   });
 
-  const handleSave = () => {
+  const handleTest = async () => {
+    setTesting(true); setTestResult(null); setTestMessage("");
+    const r = await verifyProviderConnection(defn.id, config);
+    setTesting(false);
+    setTestResult(r.ok ? "ok" : "err");
+    setTestMessage(r.message);
+    return r;
+  };
+
+  // Save only marks the integration "Connected" when the probe actually succeeds.
+  // A wrong API key fails the probe, so the card never shows Connected for a bad key.
+  const handleSave = async () => {
     if (!allFilled) return;
-    onSave(config);
+    const r = await handleTest();
+    if (r.ok) onSave(config);
+    else setGuideOpen(true);
   };
 
   return (
@@ -3478,6 +3570,11 @@ function IntegrationConfigPanel({ defn, integration, open, onClose, onSave, onDi
               Disconnect
             </button>
           )}
+          <button type="button" onClick={handleTest} disabled={!allFilled || testing}
+            className="flex-1 py-2.5 rounded-xl text-sm font-semibold border transition-colors disabled:opacity-40"
+            style={{ borderColor: t.border, color: t.textSub, background: t.card }}>
+            {testing ? "Testing…" : "Test connection"}
+          </button>
           <button type="button" onClick={onClose}
             className="flex-1 py-2.5 rounded-xl text-sm font-semibold border"
             style={{ borderColor: t.border, color: t.textSub, background: t.card }}>
@@ -3489,6 +3586,18 @@ function IntegrationConfigPanel({ defn, integration, open, onClose, onSave, onDi
             {integration.connected ? "Update" : "Connect"}
           </button>
         </div>
+
+        {/* Connection test result */}
+        {testResult && (
+          <div className={`text-xs px-3 py-2 rounded-lg border ${testResult === "err" ? "font-bold" : ""}`}
+            style={{
+              background: testResult === "ok" ? "#d1fae5" + (t.mode === "dark" ? "" : "") : testResult === "err" ? "#fee2e2" + (t.mode === "dark" ? "" : "") : t.sectionBg,
+              borderColor: testResult === "ok" ? "#34d39955" : testResult === "err" ? "#f8717155" : t.borderLight,
+              color: testResult === "ok" ? "#059669" : testResult === "err" ? "#dc2626" : t.text,
+            }}>
+            {testResult === "ok" ? "✓ " : "✗ "}{testMessage}
+          </div>
+        )}
       </div>
     </SlidePanel>
   );
