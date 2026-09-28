@@ -1,3 +1,5 @@
+import type { ApprovalLogEntry } from "./utils/approval";
+
 export type Status = "ai_generated" | "draft" | "review" | "approved" | "scheduled" | "published";
 export type ThemeMode = "light" | "dark";
 
@@ -38,6 +40,9 @@ export interface ContentItem {
   externalPostId?: string;
   /** ISO timestamp of a confirmed publish. Absent when never published. */
   publishedAt?: string;
+  /** Multi-stage approval progress (Creator -> Editor -> Brand Manager -> Client). */
+  approvalStage?: number;
+  approvalLog?: ApprovalLogEntry[];
 }
 
 export interface AuthUser {

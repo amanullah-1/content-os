@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseScheduledDate, dateKey, addDays, getWeekStart, getDueScheduledPosts, formatScheduledLabel, toDatetimeLocalValue } from "../calendar-helpers";
+import { parseScheduledDate, dateKey, addDays, getWeekStart, getDueScheduledPosts, isAutoPublishable, formatScheduledLabel, toDatetimeLocalValue } from "../calendar-helpers";
 import type { ContentItem } from "@/types";
 
 function makeItem(overrides: Partial<ContentItem> = {}): ContentItem {
@@ -225,6 +225,48 @@ describe("getDueScheduledPosts", () => {
 
   it("returns empty when no posts", () => {
     expect(getDueScheduledPosts([], now, () => true)).toEqual([]);
+  });
+
+  // Regression: the Approval tab set status to "approved"/"review", and this
+  // filter only accepted "scheduled", so approving a post made it permanently
+  // unreachable by the timer.
+  it("publishes a fully-approved post once its scheduled time arrives", () => {
+    const content = [makeItem({
+      id: 1, status: "approved", approvalStage: 4, scheduledISO: "2026-09-23T11:00:00",
+    })];
+    expect(getDueScheduledPosts(content, now, () => true).map(d => d.item.id)).toEqual([1]);
+  });
+
+  it("does not publish an approved post before its scheduled time", () => {
+    const content = [makeItem({
+      id: 1, status: "approved", approvalStage: 4, scheduledISO: "2026-09-23T13:00:00",
+    })];
+    expect(getDueScheduledPosts(content, now, () => true)).toEqual([]);
+  });
+
+  it("waits for every approval stage before publishing", () => {
+    const content = [0, 1, 2, 3].map(stage => makeItem({
+      id: stage + 1, status: "review", approvalStage: stage, scheduledISO: "2026-09-23T11:00:00",
+    }));
+    expect(getDueScheduledPosts(content, now, () => true)).toEqual([]);
+  });
+
+  it("does not publish an approved post with no scheduled time", () => {
+    const content = [makeItem({ id: 1, status: "approved", approvalStage: 4, scheduled: "" })];
+    expect(getDueScheduledPosts(content, now, () => true)).toEqual([]);
+  });
+
+  it("never republishes a published post", () => {
+    const content = [makeItem({
+      id: 1, status: "published", approvalStage: 4, scheduledISO: "2026-09-23T11:00:00",
+    })];
+    expect(getDueScheduledPosts(content, now, () => true)).toEqual([]);
+  });
+
+  it("treats an approved post missing approvalStage as not fully approved", () => {
+    // Backwards compatibility: items approved before the stage counter existed
+    // have no approvalStage. They must not publish unattended.
+    expect(isAutoPublishable(makeItem({ status: "approved" }))).toBe(false);
   });
 });
 

@@ -1,4 +1,5 @@
 import type { ContentItem } from "@/types";
+import { isFullyApproved } from "./approval";
 
 const MONTHS: Record<string, number> = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
 
@@ -72,7 +73,23 @@ export interface DuePost {
   channelConnected: boolean;
 }
 
-// Posts that are scheduled, due at-or-before `now`, and sorted oldest-first.
+// Is this post eligible to be published automatically?
+//
+// The Approval tab and the publish scheduler were two independent writers to
+// `status`, and only one of them was honoured here. Approving a post set
+// status to "approved"/"review", which this filter excluded, so clicking
+// Approve silently made a scheduled post *unpublishable* - the timer could
+// never reach it again. Nothing promoted it back to "scheduled".
+//
+// So eligibility is: explicitly scheduled, OR fully approved through the
+// 4-stage flow with a time attached. An approved post with no scheduled date is
+// still not due - it needs a time before there is anything to publish against.
+export function isAutoPublishable(item: ContentItem): boolean {
+  if (item.status === "scheduled") return true;
+  return item.status === "approved" && isFullyApproved(item.approvalStage ?? 0);
+}
+
+// Posts that are publishable, due at-or-before `now`, and sorted oldest-first.
 // `isChannelConnected` lets the caller plug in branding lookup; posts with no
 // connected channel are still returned (channelConnected=false) so the queue can
 // show them as needing manual publishing.
@@ -82,7 +99,7 @@ export function getDueScheduledPosts(
   isChannelConnected: (item: ContentItem) => boolean,
 ): DuePost[] {
   return content
-    .filter(c => c.status === "scheduled")
+    .filter(isAutoPublishable)
     .flatMap(item => {
       const date = parseScheduledDate(item);
       if (date === null || date.getTime() > now.getTime()) return [];
