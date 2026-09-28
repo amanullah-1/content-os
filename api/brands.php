@@ -93,6 +93,9 @@ try {
     $user = require_auth();
     $method = $_SERVER['REQUEST_METHOD'];
 
+    ensure_audit_log_table($pdo);
+    rate_limit_by_user($user['id'], 120, 60);
+
     if ($method === 'GET') {
         $ids = visible_brand_ids($user);
         if ($ids === null) {
@@ -135,6 +138,9 @@ try {
             )->execute([$brandId, $user['id']]);
         }
         $pdo->commit();
+        audit_log($pdo, $user['id'], 'brand.created', 'brand', $brandId, [
+            'name' => trim((string) $in['name']),
+        ]);
         respond(brand_shape($pdo, $brandId), 201);
     }
 
@@ -156,12 +162,16 @@ try {
         ]);
         write_satellites($pdo, $id, $in);
         $pdo->commit();
+        audit_log($pdo, $user['id'], 'brand.updated', 'brand', $id, [
+            'name' => trim((string) ($in['name'] ?? '')),
+        ]);
         respond(brand_shape($pdo, $id));
     }
 
     if ($method === 'DELETE') {
         if (!is_brand_owner($user, $id)) fail('Only the brand owner or a super admin can delete it.', 403);
         $pdo->prepare('DELETE FROM `brands` WHERE `id` = ?')->execute([$id]);
+        audit_log($pdo, $user['id'], 'brand.deleted', 'brand', $id, []);
         respond(['success' => true]);
     }
 

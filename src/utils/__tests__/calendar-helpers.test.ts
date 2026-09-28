@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseScheduledDate, dateKey, addDays, getWeekStart } from "../calendar-helpers";
+import { parseScheduledDate, dateKey, addDays, getWeekStart, getDueScheduledPosts } from "../calendar-helpers";
 import type { ContentItem } from "@/types";
 
 function makeItem(overrides: Partial<ContentItem> = {}): ContentItem {
@@ -122,5 +122,60 @@ describe("getWeekStart", () => {
     const start = getWeekStart(d);
     expect(start.getDay()).toBe(1);
     expect(start.getDate()).toBe(31); // Aug 31
+  });
+});
+
+describe("getDueScheduledPosts", () => {
+  const now = new Date("2026-09-23T12:00:00");
+
+  function item(id: number, status: ContentItem["status"], iso: string): ContentItem {
+    return makeItem({ id, status, scheduledISO: iso });
+  }
+
+  it("returns only scheduled posts due at or before now", () => {
+    const content = [
+      item(1, "scheduled", "2026-09-23T11:00:00"),
+      item(2, "scheduled", "2026-09-23T13:00:00"),
+      item(3, "published", "2026-09-23T10:00:00"),
+      item(4, "draft", "2026-09-23T10:00:00"),
+    ];
+    const due = getDueScheduledPosts(content, now, () => true);
+    expect(due.map(d => d.item.id)).toEqual([1]);
+  });
+
+  it("includes posts exactly at now", () => {
+    const content = [item(1, "scheduled", "2026-09-23T12:00:00")];
+    const due = getDueScheduledPosts(content, now, () => true);
+    expect(due.map(d => d.item.id)).toEqual([1]);
+  });
+
+  it("sorts oldest first", () => {
+    const content = [
+      item(1, "scheduled", "2026-09-23T11:00:00"),
+      item(2, "scheduled", "2026-09-23T08:00:00"),
+      item(3, "scheduled", "2026-09-23T10:00:00"),
+    ];
+    const due = getDueScheduledPosts(content, now, () => true);
+    expect(due.map(d => d.item.id)).toEqual([2, 3, 1]);
+  });
+
+  it("reports channelConnected from the callback", () => {
+    const content = [
+      item(1, "scheduled", "2026-09-23T11:00:00"),
+      item(2, "scheduled", "2026-09-23T10:00:00"),
+    ];
+    const due = getDueScheduledPosts(content, now, c => c.id === 1);
+    expect(due.find(d => d.item.id === 1)!.channelConnected).toBe(true);
+    expect(due.find(d => d.item.id === 2)!.channelConnected).toBe(false);
+  });
+
+  it("skips posts with no parseable date", () => {
+    const content = [makeItem({ id: 1, status: "scheduled", scheduled: "not a date" })];
+    const due = getDueScheduledPosts(content, now, () => true);
+    expect(due).toEqual([]);
+  });
+
+  it("returns empty when no posts", () => {
+    expect(getDueScheduledPosts([], now, () => true)).toEqual([]);
   });
 });

@@ -7,9 +7,22 @@
 //   otherwise           -> only brands in brand_members for that user;
 //                          content inherits access via content_items.brand_id.
 
+require_once __DIR__ . '/logger.php';
+require_once __DIR__ . '/ratelimit.php';
+
 function cors(): void
 {
-    header('Access-Control-Allow-Origin: *');
+    // The frontend runs on a different port (dev: 8443) than this API (80),
+    // and on LAN IPs, so echo the Origin and allow cookies for actual CORS
+    // requests. `*` cannot be combined with Access-Control-Allow-Credentials.
+    $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
+    if ($origin !== '') {
+        header('Access-Control-Allow-Origin: ' . $origin);
+        header('Access-Control-Allow-Credentials: true');
+        header('Vary: Origin');
+    } else {
+        header('Access-Control-Allow-Origin: *');
+    }
     header('Access-Control-Allow-Headers: Content-Type, Authorization');
     header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
     header('Content-Type: application/json; charset=utf-8');
@@ -233,6 +246,55 @@ function role_label(string $slug): string
         'client' => 'Client', 'viewer' => 'Viewer',
     ];
     return $map[$slug] ?? ucfirst(str_replace('_', ' ', $slug));
+}
+
+// --- Audit logging ----------------------------------------------------------
+
+/** Write an audit-log row (failures are logged to file, never block the caller). */
+function audit_log(PDO $pdo, string $userId, string $action, string $entityType, int $entityId, array $details = []): void
+{
+    global $audit_pdo;
+    if ($audit_pdo === null) $audit_pdo = $pdo;
+    try {
+        $stmt = $pdo->prepare(
+            'INSERT INTO `audit_logs` (`user_id`, `action`, `entity_type`, `entity_id`, `details`, `ip`, `user_agent`)
+             VALUES (?, ?, ?, ?, ?, ?, ?)'
+        );
+        $stmt->execute([
+            $userId, $action, $entityType, $entityId,
+            json_encode($details, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+            substr((string) ($_SERVER['HTTP_USER_AGENT'] ?? 'unknown'), 0, 255),
+        ]);
+        log_debug('Audit log entry', ['action' => $action, 'entity' => $entityType . ':' . $entityId, 'user' => $userId]);
+    } catch (Throwable $e) {
+        log_warning('Failed to write audit log', ['error' => $e->getMessage()]);
+    }
+}
+
+/** Ensure the audit_logs table exists (idempotent, called lazily on first write). */
+function ensure_audit_log_table(PDO $pdo): void
+{
+    global $audit_pdo;
+    if ($audit_pdo === NULL) {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS `audit_logs` (
+                `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                `user_id` VARCHAR(64) NOT NULL,
+                `action` VARCHAR(100) NOT NULL,
+                `entity_type` VARCHAR(50) NOT NULL,
+                `entity_id` BIGINT UNSIGNED NOT NULL DEFAULT 0,
+                `details` JSON NOT NULL,
+                `ip` VARCHAR(45) NOT NULL DEFAULT '',
+                `user_agent` VARCHAR(255) NOT NULL DEFAULT '',
+                `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                INDEX `idx_audit_user` (`user_id`),
+                INDEX `idx_audit_entity` (`entity_type`, `entity_id`),
+                INDEX `idx_audit_created` (`created_at`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        ");
+        $audit_pdo = $pdo;
+    }
 }
 
 function role_id(PDO $pdo, string $slug): ?int

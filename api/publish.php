@@ -21,7 +21,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-$SUPPORTED = ['devto', 'woocommerce', 'facebook', 'linkedin', 'instagram', 'tiktok'];
+$SUPPORTED = ['devto', 'woocommerce', 'facebook', 'linkedin', 'instagram', 'tiktok', 'x'];
+
+// Graph API version used for Facebook/Instagram. v19.0 is end-of-life, so the
+// default is v23.0. Override with CONTENTOS_FB_GRAPH_VERSION (e.g. 'v22.0').
+$GRAPH = getenv('CONTENTOS_FB_GRAPH_VERSION') ?: 'v23.0';
 
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
     echo json_encode(['ok' => true, 'platforms' => $SUPPORTED]);
@@ -122,20 +126,74 @@ function handle_woocommerce(array $config, array $content): array
     return ok('Published to WooCommerce — Post #' . ($data['id'] ?? '?'));
 }
 
+/**
+ * Exchange a long-lived *user* token for a *page* token.
+ *
+ * Graph rejects page writes made with a plain user token (error #200) even when
+ * the user has pages_manage_posts, so every page-scoped call has to be made with
+ * the page token. Returns '' when the page cannot be reached with this token.
+ */
+function facebook_page_token(string $pageId, string $token): string
+{
+    global $GRAPH;
+    static $cache = [];
+    $memo = $pageId . '|' . substr($token, -8);
+    if (isset($cache[$memo])) return $cache[$memo];
+
+    [$status, $data, $err] = http_json(
+        'GET',
+        "https://graph.facebook.com/$GRAPH/$pageId?fields=access_token&access_token=" . rawurlencode($token),
+        [],
+        null
+    );
+    if ($err !== '' || $status < 200 || $status >= 300) return '';
+
+    $pageToken = (string) ($data['access_token'] ?? '');
+    $cache[$memo] = $pageToken;
+    return $pageToken;
+}
+
+/**
+ * POST to /{pageId}/feed, transparently swapping a user token for a page token
+ * when Graph rejects the write with #200.
+ */
+function facebook_feed(string $pageId, string $token, string $message): array
+{
+    global $GRAPH;
+    $url = "https://graph.facebook.com/$GRAPH/$pageId/feed";
+    $body = ['message' => $message, 'access_token' => $token];
+
+    [$status, $data, $err] = http_json('POST', $url, ['Content-Type: application/json'], $body);
+    if ($err === '' && $status >= 200 && $status < 300 && !isset($data['error'])) {
+        return $data;
+    }
+    if ($err !== '') return ['error' => ['message' => $err, 'code' => 0]];
+
+    $code = (int) ($data['error']['code'] ?? 0);
+    $subcode = (int) ($data['error']['error_subcode'] ?? 0);
+    // #200 = page write needs a page token; #10/#190 = page not authorised.
+    if (!in_array($code, [10, 190, 200], true) || $subcode === 33) return $data;
+
+    $pageToken = facebook_page_token($pageId, $token);
+    if ($pageToken === '') return $data; // give up with the original error
+
+    [$status, $data, $err] = http_json('POST', $url, ['Content-Type: application/json'], [
+        'message' => $message,
+        'access_token' => $pageToken,
+    ]);
+    if ($err !== '') return ['error' => ['message' => $err, 'code' => 0]];
+    return $data;
+}
+
 function handle_facebook(array $config, array $content): array
 {
-    [$status, $data, $err] = http_json(
-        'POST',
-        'https://graph.facebook.com/v19.0/' . ($config['pageId'] ?? '') . '/feed',
-        ['Content-Type: application/json'],
-        [
-            'message' => $content['caption'] . "\n\n" . $content['hashtags'],
-            'access_token' => $config['accessToken'] ?? '',
-        ]
+    $data = facebook_feed(
+        (string) ($config['pageId'] ?? ''),
+        (string) ($config['accessToken'] ?? ''),
+        $content['caption'] . "\n\n" . $content['hashtags']
     );
-    if ($err !== '') fail($err);
-    if ($status < 200 || $status >= 300 || isset($data['error'])) {
-        fail(($data['error']['message'] ?? null) ?: "HTTP $status");
+    if (isset($data['error'])) {
+        fail(($data['error']['message'] ?? null) ?: 'Unknown Graph error');
     }
     return ok('Published to Facebook — Post ' . ($data['id'] ?? '?'));
 }
@@ -169,7 +227,7 @@ function handle_instagram(array $config, array $content): array
     // Step 1: create media container.
     [$status, $data, $err] = http_json(
         'POST',
-        "https://graph.facebook.com/v19.0/{$account}/media",
+        "https://graph.facebook.com/$GRAPH/{$account}/media",
         ['Content-Type: application/json'],
         [
             'image_url' => $content['caption'],
@@ -184,7 +242,7 @@ function handle_instagram(array $config, array $content): array
     // Step 2: publish the container.
     [$pStatus, $pData, $pErr] = http_json(
         'POST',
-        "https://graph.facebook.com/v19.0/{$account}/media_publish",
+        "https://graph.facebook.com/$GRAPH/{$account}/media_publish",
         ['Content-Type: application/json'],
         ['creation_id' => $data['id'] ?? '', 'access_token' => $token]
     );
@@ -217,6 +275,63 @@ function handle_tiktok(array $config, array $content): array
     return ok('TikTok upload initialized — ' . ($data['data']['publish_url'] ?? 'use TikTok app to complete'));
 }
 
+/**
+ * Build a Twitter/X API v2 OAuth 1.0a Authorization header.
+ * https://developer.x.com/en/docs/authentication/oauth-1-0a/obtaining-user-access-tokens
+ */
+function x_oauth_header(array $config, string $method, string $url, array $params = []): array
+{
+    $ts = (string) time();
+    $oauth = [
+        'oauth_consumer_key' => $config['apiKey'] ?? '',
+        'oauth_nonce' => bin2hex(random_bytes(16)),
+        'oauth_signature_method' => 'HMAC-SHA1',
+        'oauth_timestamp' => $ts,
+        'oauth_token' => $config['accessToken'] ?? '',
+        'oauth_version' => '1.0',
+    ];
+    $all = array_merge($params, $oauth);
+    uksort($all, 'strcmp');
+    $parts = [];
+    foreach ($all as $k => $v) {
+        $parts[] = rawurlencode($k) . '=' . rawurlencode((string) $v);
+    }
+    $base = strtoupper($method) . '&' . rawurlencode($url) . '&' . rawurlencode(implode('&', $parts));
+    $key = rawurlencode($config['apiSecret'] ?? '') . '&' . rawurlencode($config['accessTokenSecret'] ?? '');
+    $oauth['oauth_signature'] = base64_encode(hash_hmac('sha1', $base, $key, true));
+
+    $headerParts = [];
+    foreach ($oauth as $k => $v) {
+        $headerParts[] = sprintf('%s="%s"', rawurlencode($k), rawurlencode((string) $v));
+    }
+    return ['Authorization: OAuth ' . implode(', ', $headerParts)];
+}
+
+function handle_x(array $config, array $content): array
+{
+    $text = trim($content['caption'] . "\n\n" . $content['hashtags']);
+    if (mb_strlen($text) > 280) {
+        $text = mb_substr($text, 0, 277) . '…';
+    }
+    $url = 'https://api.x.com/2/tweets';
+    $headers = array_merge(
+        ['Content-Type: application/json'],
+        x_oauth_header($config, 'POST', $url)
+    );
+    [$status, $data, $err] = http_json('POST', $url, $headers, ['text' => $text]);
+    if ($err !== '') fail($err);
+    if ($status < 200 || $status >= 300) {
+        $msg = $data['detail'] ?? $data['title'] ?? null;
+        if (isset($data['errors'][0]['message']) || isset($data['errors'][0]['detail'])) {
+            $msg = $data['errors'][0]['detail'] ?? $data['errors'][0]['message'];
+        } elseif (isset($data['errors'][0]['message'])) {
+            $msg = $data['errors'][0]['message'];
+        }
+        fail(($msg ?? '') ? $msg : "HTTP $status");
+    }
+    return ok('Published to X — Tweet ID ' . ($data['data']['id'] ?? '?'));
+}
+
 // --- Dispatch ---
 $raw = file_get_contents('php://input');
 $req = json_decode((string) $raw, true);
@@ -237,6 +352,7 @@ switch ($platform) {
     case 'linkedin':    $result = handle_linkedin($config, $content); break;
     case 'instagram':   $result = handle_instagram($config, $content); break;
     case 'tiktok':      $result = handle_tiktok($config, $content); break;
+    case 'x':           $result = handle_x($config, $content); break;
     default:
         http_response_code(200);
         echo json_encode([

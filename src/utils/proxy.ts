@@ -45,6 +45,7 @@ export async function proxyPublish(payload: ProxyPayload): Promise<ProxyResult> 
 
 // Platforms that MUST use the proxy (CORS-blocked from browser)
 export const PROXY_REQUIRED_PLATFORMS = new Set([
+  "x",
   "facebook",
   "instagram",
   "linkedin",

@@ -1,21 +1,74 @@
 // ContentOS relational API client (local PHP backend in /api).
 // Server is the source of truth when a token exists; without one the app
 // falls back to the legacy localStorage + KV behaviour (offline / pre-login).
+//
+// Phase 1 auth hardening:
+//   - Access token is kept in module memory only (not localStorage) so an XSS
+//     hole can't exfiltrate it. 30-minute lifetime.
+//   - Refresh token lives in an HTTP-only cookie (`contentos_refresh`, 7 days);
+//     JS never sees it. `/auth.php?action=refresh` rotates both tokens.
+//   - apiFetch transparently refreshes once on a 401 and retries the request.
+//   - All exported function signatures are unchanged from the legacy client.
 
-const API_ROOT = (
-  import.meta.env.VITE_KV_BASE_URL || "http://localhost/ContentOS/api"
-).replace(/\/$/, "");
+const API_ROOT = (() => {
+  const host = typeof window !== "undefined" ? (window.location.hostname || "localhost") : "localhost";
+  return (import.meta.env.VITE_API_ROOT || `http://${host}/ContentOS/api`).replace(/\/$/, "");
+})();
 
-const TOKEN_KEY = "contentOS_token";
+// ── In-memory access token + refresh plumbing ───────────────────────────────
 
+let accessToken: string | null = null;
+let refreshInFlight: Promise<ServerUser | null> | null = null;
+
+/** Access token currently held in memory, or null. */
 export function getToken(): string | null {
-  try { return localStorage.getItem(TOKEN_KEY); } catch { return null; }
+  return accessToken;
 }
-export function setToken(t: string | null) {
-  try {
-    if (t) localStorage.setItem(TOKEN_KEY, t);
-    else localStorage.removeItem(TOKEN_KEY);
-  } catch { /* ignore */ }
+
+/** Store (or clear) the access token. Replaces the old localStorage behavior. */
+export function setToken(t: string | null): void {
+  accessToken = t;
+  tokenListeners.forEach(fn => fn());
+}
+
+const tokenListeners = new Set<() => void>();
+
+/** Subscribe to access-token changes (login, logout, silent refresh). Returns an unsubscribe fn. */
+export function onTokenChange(fn: () => void): () => void {
+  tokenListeners.add(fn);
+  return () => { tokenListeners.delete(fn); };
+}
+
+/** Ask the server (via the HTTP-only cookie) for a fresh access token. */
+export async function apiRefresh(): Promise<AuthResult> {
+  return apiFetch<AuthResult>(`/auth.php?action=refresh`, { method: "POST" });
+}
+
+/**
+ * Restore a session on boot using the refresh cookie. Safe to call once at
+ * startup; subsequent calls while a refresh is in flight share that promise.
+ * Returns the restored user, or null when there is no valid session.
+ */
+export async function tryBootstrapAuth(): Promise<ServerUser | null> {
+  if (accessToken) {
+    try {
+      const { user } = await apiMe(accessToken);
+      return user;
+    } catch { /* fall through to refresh */ }
+  }
+  if (!refreshInFlight) {
+    refreshInFlight = apiRefresh()
+      .then(({ token, user }) => { setToken(token); return user; })
+      .catch(() => null)
+      .finally(() => { refreshInFlight = null; });
+  }
+  return refreshInFlight;
+}
+
+/** Force a refresh cycle now (used by the 401 code path). */
+function refreshAccessToken(): Promise<string | null> {
+  const inFlight = tryBootstrapAuth();
+  return inFlight.then(u => getToken() || (u ? (accessToken ?? null) : null));
 }
 
 export interface ServerUser {
@@ -41,6 +94,7 @@ async function apiFetch<T>(path: string, opts: {
   try {
     res = await fetch(`${API_ROOT}${path}`, {
       method: opts.method || "GET",
+      credentials: "include",
       headers: {
         "Content-Type": "application/json",
         ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}),
@@ -50,6 +104,38 @@ async function apiFetch<T>(path: string, opts: {
   } catch (e) {
     throw new ApiError(0, e instanceof Error ? e.message : "Network error", true);
   }
+
+  // On 401, try a single token refresh then retry (avoids an expired access
+  // token booting the user out mid-session). Never loops on /refresh itself.
+  if (res.status === 401 && !path.includes("action=refresh")) {
+    const fresh = await refreshAccessToken();
+    if (fresh) return apiFetchAgainAfterRefresh<T>(path, opts, fresh);
+    throw new ApiError(401, "Not authenticated.");
+  }
+  return parseResponse<T>(res, path);
+}
+
+async function apiFetchAgainAfterRefresh<T>(path: string, opts: {
+  method?: string; body?: unknown; token?: string | null;
+}, freshToken: string): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${API_ROOT}${path}`, {
+      method: opts.method || "GET",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${freshToken}`,
+      },
+      ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
+    });
+  } catch (e) {
+    throw new ApiError(0, e instanceof Error ? e.message : "Network error", true);
+  }
+  return parseResponse<T>(res, path);
+}
+
+async function parseResponse<T>(res: Response, _path: string): Promise<T> {
   if (res.status === 401) throw new ApiError(401, "Not authenticated.");
   let json: unknown = null;
   try { json = await res.json(); } catch { /* non-JSON */ }
@@ -80,6 +166,12 @@ export const apiGoogle = (credential: string) =>
 export async function apiLogout(token: string): Promise<void> {
   try { await apiFetch(`/auth.php?action=logout`, { method: "POST", token }); }
   catch { /* logging out locally regardless */ }
+}
+
+/** Revoke every session for the current user (security self-service). */
+export async function apiRevokeAllSessions(token: string): Promise<void> {
+  try { await apiFetch(`/auth.php?action=revoke-all`, { method: "POST", token }); }
+  catch { /* clear locally regardless */ }
 }
 
 export const apiMe = (token: string) =>
@@ -132,6 +224,27 @@ export const apiUpdateContent = (token: string, id: number, data: Record<string,
 
 export const apiDeleteContent = (token: string, id: number) =>
   apiFetch<{ success: boolean }>(`/content.php?id=${id}`, { method: "DELETE", token });
+
+// ── Content templates ───────────────────────────────────────────────────────
+
+export type TemplateDTO = Record<string, unknown> & { id: number };
+
+export const apiListTemplates = (token: string, params: { brandId?: number; category?: string } = {}) => {
+  const q = new URLSearchParams();
+  if (params.brandId) q.set("brand_id", String(params.brandId));
+  if (params.category) q.set("category", params.category);
+  const qs = q.toString();
+  return apiFetch<TemplateDTO[]>(`/templates.php${qs ? `?${qs}` : ""}`, { token });
+};
+
+export const apiCreateTemplate = (token: string, data: Record<string, unknown>) =>
+  apiFetch<TemplateDTO>(`/templates.php`, { method: "POST", token, body: data });
+
+export const apiUpdateTemplate = (token: string, id: number, data: Record<string, unknown>) =>
+  apiFetch<TemplateDTO>(`/templates.php?id=${id}`, { method: "PUT", token, body: data });
+
+export const apiDeleteTemplate = (token: string, id: number) =>
+  apiFetch<{ success: boolean }>(`/templates.php?id=${id}`, { method: "DELETE", token });
 
 // ── Team (super admin only) ─────────────────────────────────────────────────
 

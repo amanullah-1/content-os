@@ -9,6 +9,65 @@ and this project adheres to commit history located in `git log`.
 
 ## [Unreleased]
 
+### `api/publish.php`
+#### Facebook page-token exchange (fixes post automation end-to-end)
+- **Graph rejects page writes made with a plain *user* token** — `POST /{pageId}/feed` returned
+  `(#200) … requires both pages_read_engagement and pages_manage_posts … with page token` even
+  though the configured token was valid and carried `pages_manage_posts`. `/me/accounts` was empty
+  for that user, but a page token could still be minted for the page.
+- **`facebook_page_token()`** exchanges the configured user token for a page token via
+  `GET /{pageId}?fields=access_token`, memoised per request.
+- **`facebook_feed()`** posts to `/{pageId}/feed` and, on Graph error `#200` (or `#10`/`#190`),
+  transparently retries once with the page token. If the exchange fails it surfaces the original
+  Graph error, so a genuinely misconfigured page still reports a useful message.
+- **Graph API version moved off end-of-life `v19.0` to `v23.0`** for the Facebook and Instagram
+  handlers, via a single `$GRAPH` constant. Override with the `CONTENTOS_FB_GRAPH_VERSION` env var.
+- Verified live against the appstai.com page (`1665501390368935`): `{"success":true,
+  "message":"Published to Facebook — Post 1665501390368935_…"}` through the app's own proxy
+  endpoint. The Instagram handler now shares `$GRAPH` but is unverified — no IG credentials are
+  configured yet.
+
+### `src/utils/publish-queue.ts` (new)
+Publish queue engine with explicit per-item outcomes:
+- **`PublishState`** = `queued` → `publishing` → `success` / `failed` / `blocked` / `skipped`, with a
+  full `attempts` history per row.
+- **`buildQueue()`** merges a fresh view of due posts into the live queue without discarding results.
+  Rows that already published, failed or are blocked are never rebuilt; a post that is no longer due
+  drops out and one that comes back (e.g. rescheduled into the past) is re-added. This fixes the
+  previous behaviour where the queue was reset on every re-render — and the stale-closure bug where a
+  single auto-publish failure re-queued every scheduled post as brand new.
+- **`runPublishQueue()`** publishes oldest-first, one row at a time, and never throws: a rejected
+  publisher becomes a failed row and the run continues. Progress is streamed as
+  `start / attempt / skip / circuit / progress / report` patches so the caller owns the state and
+  results survive closing the panel.
+- **Failure classification** — auth/config problems (`401`, `403`, invalid token, channel not
+  connected) are marked `blocked` ("Needs setup") and are not retried; anything else is `failed` and
+  can be retried up to `MAX_PUBLISH_ATTEMPTS` (3).
+- **Circuit breaker** — 4 consecutive failures with no success in between skips the rest of the run
+  instead of hammering a downed API.
+- **Cancel** resolves whatever is already in flight (an upstream post must always flip its status or
+  the next auto-publish tick publishes it twice) and only skips the not-yet-started rows.
+
+### `src/App.tsx`
+#### Publish queue / partial failures
+- **`PublishQueuePanel` reworked**: per-row state badge, `attempt n/3`, per-row **Retry**,
+  **Publish All Due**, **Retry N Failed**, a **Failed** tab, a dismissible run summary
+  (`2 published · 1 failed`), a progress bar with **Cancel**, and **Clear finished**. Results now
+  persist across re-renders and panel close/reopen.
+- **`publishToConnectedPlatform(item, brands)`** takes the brand list instead of a pre-resolved
+  channel + platform definition, and returns a "not connected" result instead of throwing, so one
+  unconfigured channel can no longer abort a whole batch. Channel resolution is centralised in
+  `canPublishItem()`.
+- **Auto-publish failures** now dispatch a `contentos:auto-publish-failed` window event that the open
+  queue listens to, so a background failure is recorded instead of being silently re-queued later.
+- Removed the duplicated local `parseScheduledDate` / `dateKey` / `addDays` / `getWeekStart` helpers
+  in favour of `src/utils/calendar-helpers.ts`, which the queue engine also uses.
+
+### `src/utils/__tests__/publish-queue.test.ts` (new)
+27 tests: queue building, retry rules, partial-failure runs (mixed success/failure/blocked, thrown
+errors, auth vs rate-limit classification, attempt cap, cancel, circuit breaker), progress patches
+and report summaries.
+
 ### `src/App.tsx`
 
 #### Image generation reliability

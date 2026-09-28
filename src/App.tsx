@@ -11,6 +11,20 @@ import {
 import { proxyPublish, shouldUseProxy } from "./utils/proxy";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { validate, emailRule, passwordRule, validatePasswordMatch } from "./utils/validation";
+import {
+  APPROVAL_STAGES,
+  approve as approveStage, reject as rejectStage, resubmit as resubmitStage,
+  comment as addComment, approvalStageLabel, isFullyApproved,
+  type ApprovalLogEntry,
+} from "./utils/approval";
+import { runAutoPublish } from "./utils/auto-publish";
+import { addDays, dateKey, getWeekStart, parseScheduledDate } from "./utils/calendar-helpers";
+import {
+  buildQueue, canRetry, countByState, makeQueueEntry, publishStateLabel, resetEntries,
+  retryableIds, runPublishQueue, summarizeReport,
+  MAX_PUBLISH_ATTEMPTS,
+  type PublishEntry, type PublishFilter, type PublishRunPatch, type PublishRunReport, type PublishState,
+} from "./utils/publish-queue";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -194,6 +208,8 @@ interface ContentItem {
   scheduledISO?: string;
   generatedImageUrl?: string;
   generatedVideoUrl?: string;
+  approvalStage?: number;
+  approvalLog?: ApprovalLogEntry[];
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
@@ -1866,11 +1882,38 @@ function ContentFormPanel({ item, brands, open, onClose, onSave, apiKey, aiModel
 
 // ─── Post Detail Panel ────────────────────────────────────────────────────────
 
-function PostDetailPanel({ post, onClose, onEdit, onDelete, onStatusChange }: {
+function CommentComposer({ onSend, theme }: { onSend: (text: string) => void; theme: Theme }) {
+  const [text, setText] = useState("");
+  const send = () => { if (text.trim()) { onSend(text.trim()); setText(""); } };
+  return (
+    <div className="flex items-center gap-2 mt-2">
+      <input
+        value={text}
+        onChange={e => setText(e.target.value)}
+        onKeyDown={e => { if (e.key === "Enter") send(); }}
+        placeholder="Add a comment…"
+        className="flex-1 text-xs px-3 py-1.5 rounded-lg border outline-none"
+        style={{ background: theme.inputBg, borderColor: theme.border, color: theme.text }}
+      />
+      <button onClick={send}
+        className="text-xs px-3 py-1.5 rounded-lg font-semibold text-white transition-opacity hover:opacity-90"
+        style={{ background: theme.primary }}>
+        Send
+      </button>
+    </div>
+  );
+}
+
+function PostDetailPanel({ post, onClose, onEdit, onDelete, onStatusChange, onApprove, onReject, onComment }: {
   post: ContentItem; onClose: () => void; onEdit: () => void;
   onDelete: () => void; onStatusChange: (s: Status) => void;
+  onApprove: (by: string, note?: string) => void;
+  onReject: (by: string, note?: string) => void;
+  onComment: (by: string, text: string) => void;
 }) {
   const { t } = useTheme();
+  const { user } = useAuth();
+  const userName = user?.name || "User";
   const STEPS: Status[] = ["ai_generated","review","approved","scheduled","published"];
   const STEP_LABELS = ["AI Generated","In Review","Approved","Scheduled","Published"];
   const currentStep = STEPS.indexOf(post.status === "draft" ? "review" : post.status);
@@ -2002,10 +2045,63 @@ function PostDetailPanel({ post, onClose, onEdit, onDelete, onStatusChange }: {
 
           {/* Approval actions */}
           {(post.status === "review" || post.status === "ai_generated") && (
-            <div className="flex gap-2">
-              <button onClick={() => onStatusChange("draft")} className="flex-1 py-2.5 rounded-xl text-sm font-semibold border transition-colors" style={{ borderColor: t.dangerBorder, color: t.danger, background: t.card }}>Reject</button>
-              <button className="flex-1 py-2.5 rounded-xl text-sm font-semibold border transition-colors" style={{ borderColor:"#93c5fd", color:"#2563eb", background: t.card }}>Request Edit</button>
-              <button onClick={() => onStatusChange("approved")} className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-90" style={{ background:"#059669" }}>Approve →</button>
+            <div className="space-y-3">
+              <div className="p-3 rounded-xl border" style={{ background: t.sectionBg, borderColor: t.borderLight }}>
+                <div className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: t.textMuted }}>Approval Flow</div>
+                <div className="flex items-center">
+                  {APPROVAL_STAGES.map((stage, i) => {
+                    const stageNum = post.approvalStage ?? 0;
+                    const isDone = i < stageNum;
+                    const isActive = i === stageNum && stageNum < APPROVAL_STAGES.length;
+                    return (
+                      <div key={stage} className="flex items-center flex-1 last:flex-none">
+                        <div className="flex flex-col items-center">
+                          <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: isDone ? "#10b981" : isActive ? "#2563eb" : t.tagBg, color: isDone || isActive ? "white" : t.textFaint }}>
+                            {isDone ? "✓" : i + 1}
+                          </div>
+                          <div className="mt-1 text-[9px] font-semibold whitespace-nowrap" style={{ color: isDone ? "#059669" : isActive ? "#2563eb" : t.textMuted }}>{stage}</div>
+                        </div>
+                        {i < APPROVAL_STAGES.length - 1 && <div className="flex-1 h-0.5 mx-1 mb-4 rounded-full" style={{ background: isDone ? "#6ee7b7" : t.borderLight }} />}
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="mt-2 text-xs" style={{ color: t.textMuted }}>
+                  {isFullyApproved(post.approvalStage ?? 0) ? "Fully approved ✓ — all sign-offs complete." : `Now awaiting: ${approvalStageLabel(post.approvalStage ?? 0)}`}
+                </div>
+              </div>
+
+              <div className="p-3 rounded-xl border" style={{ background: t.sectionBg, borderColor: t.borderLight }}>
+                <div className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: t.textMuted }}>Activity</div>
+                <div className="space-y-2 max-h-36 overflow-y-auto mb-2">
+                  {(post.approvalLog ?? []).length === 0 ? (
+                    <p className="text-xs" style={{ color: t.textMuted }}>No approval activity yet.</p>
+                  ) : (post.approvalLog ?? []).slice(-6).map(en => {
+                    const dot = en.action === "approved" ? "#059669" : en.action === "rejected" ? "#dc2626" : en.action === "commented" ? "#2563eb" : "#d97706";
+                    return (
+                      <div key={en.id} className="flex items-start gap-2 text-xs">
+                        <span className="w-1.5 h-1.5 rounded-full mt-1 flex-shrink-0" style={{ background: dot }} />
+                        <div className="min-w-0">
+                          <span className="font-semibold" style={{ color: t.text }}>{en.by}</span>{" "}
+                          <span style={{ color: t.textMuted }}>
+                            {en.action === "approved" ? `approved as ${en.stage}` : en.action === "rejected" ? `rejected at ${en.stage}` : en.action === "resubmitted" ? "resubmitted" : "commented"}
+                            {" · "}{new Date(en.at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}
+                          </span>
+                          {en.note && <p className="mt-0.5 leading-relaxed" style={{ color: t.text }}>{en.note}</p>}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <CommentComposer onSend={text => onComment(userName, text)} theme={t} />
+              </div>
+
+              <div className="flex gap-2">
+                <button onClick={() => onReject(userName)} className="flex-1 py-2.5 rounded-xl text-sm font-semibold border transition-colors" style={{ borderColor: t.dangerBorder, color: t.danger, background: t.card }}>✕ Reject</button>
+                <button onClick={() => onApprove(userName)} className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-90" style={{ background: "#059669" }}>
+                  {isFullyApproved(post.approvalStage ?? 0) ? "✓ Approve" : `✓ Approve as ${approvalStageLabel(post.approvalStage ?? 0)}`}
+                </button>
+              </div>
             </div>
           )}
           {post.status === "approved" && (
@@ -2574,15 +2670,25 @@ function BrandsView({ brands, onView, onEdit, onDelete, onNew }: {
 
 // ─── Content View ─────────────────────────────────────────────────────────────
 
-function ContentView({ brands, content, onView, onEdit, onDelete, onNew }: {
+function ContentView({ brands, content, onView, onEdit, onDelete, onNew, onDeleteMany, onStatusMany, onRescheduleMany }: {
   brands: Brand[]; content: ContentItem[]; onView: (id: number) => void;
   onEdit: (id: number) => void; onDelete: (id: number) => void; onNew: () => void;
+  onDeleteMany: (ids: number[]) => void;
+  onStatusMany: (ids: number[], s: Status) => void;
+  onRescheduleMany: (ids: number[], scheduled: string, scheduledISO: string) => void;
 }) {
   const { t } = useTheme();
   const [filter, setFilter] = useState<"all" | Status>("all");
   const [brandFilter, setBrandFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [hoverId, setHoverId] = useState<number | null>(null);
+  const [bulkMode, setBulkMode] = useState(false);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [bulkStatus, setBulkStatus] = useState<Status>("scheduled");
+  const [scheduleModal, setScheduleModal] = useState(false);
+  const [rescheduleDate, setRescheduleDate] = useState("");
+  const [rescheduleStatus, setRescheduleStatus] = useState<Status>("scheduled");
+  const [confirmDeleteBulk, setConfirmDeleteBulk] = useState(false);
 
   const filtered = content.filter(i => {
     if (filter !== "all" && i.status !== filter) return false;
@@ -2590,6 +2696,27 @@ function ContentView({ brands, content, onView, onEdit, onDelete, onNew }: {
     if (search && !i.caption.toLowerCase().includes(search.toLowerCase()) && !i.brand.toLowerCase().includes(search.toLowerCase())) return false;
     return true;
   });
+
+  const selectedIds = Array.from(selected);
+  const allSelected = filtered.length > 0 && filtered.every(i => selected.has(i.id));
+  const toggleAll = () => {
+    if (allSelected) setSelected(new Set());
+    else setSelected(new Set(filtered.map(i => i.id)));
+  };
+  const toggleOne = (id: number) => {
+    setSelected(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  };
+  const clearSelection = () => { setSelected(new Set()); setBulkMode(false); };
+
+  const applyReschedule = () => {
+    const d = new Date(rescheduleDate);
+    if (isNaN(d.getTime()) || selectedIds.length === 0) return;
+    const sched = `${d.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})} — ${d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true})}`;
+    onRescheduleMany(selectedIds, sched, rescheduleDate);
+    onStatusMany(selectedIds, rescheduleStatus);
+    setScheduleModal(false);
+    clearSelection();
+  };
 
   const FILTERS: { key: "all" | Status; label: string; count: number }[] = [
     { key:"all", label:"All", count:content.length },
@@ -2630,7 +2757,42 @@ function ContentView({ brands, content, onView, onEdit, onDelete, onNew }: {
             <option value="all">All Brands</option>
             {brands.map(b => <option key={b.id} value={b.name}>{b.name}</option>)}
           </select>
+          <button onClick={() => { setBulkMode(b => !b); setSelected(new Set()); }}
+            className="text-sm px-3 py-2 rounded-lg border font-semibold transition-all"
+            style={{ background: bulkMode ? t.primary + "22" : t.card, borderColor: bulkMode ? t.primary + "80" : t.border, color: bulkMode ? t.primary : t.textSub }}>
+            {bulkMode ? "✓ Bulk Mode" : "☰ Bulk"}
+          </button>
         </div>
+        {bulkMode && (
+          <div className="flex items-center gap-2.5 flex-wrap p-3 rounded-xl border" style={{ background: t.card, borderColor: selected.size > 0 ? t.primary + "60" : t.border }}>
+            <label className="flex items-center gap-2 text-sm cursor-pointer select-none" style={{ color: t.text }}>
+              <input type="checkbox" checked={allSelected} onChange={toggleAll} className="w-4 h-4 accent-[#4f46e5]" />
+              <span className="font-semibold">{selected.size > 0 ? `${selected.size} selected` : "Select all"}</span>
+              {filtered.length > 0 && selected.size > 0 && <span className="text-xs" style={{ color: t.textMuted }}>of {filtered.length} shown</span>}
+            </label>
+            {selected.size > 0 && (
+              <div className="flex items-center gap-2 flex-wrap ml-1">
+                <span className="text-xs font-semibold hidden sm:inline" style={{ color: t.textMuted }}>Set status:</span>
+                <select value={bulkStatus} onChange={e => setBulkStatus(e.target.value as Status)}
+                  className="text-xs px-2 py-1.5 rounded-lg border outline-none cursor-pointer" style={{ background: t.inputBg, borderColor: t.border, color: t.text }}>
+                  {ALL_STATUSES.map(s => <option key={s} value={s}>{statusCfg(s, t).label}</option>)}
+                </select>
+                <button onClick={() => { onStatusMany(selectedIds, bulkStatus); clearSelection(); }}
+                  className="text-xs px-3 py-1.5 rounded-lg font-bold text-white transition-opacity hover:opacity-90" style={{ background: t.primary }}>
+                  Apply
+                </button>
+                <button onClick={() => { setRescheduleDate(new Date().toISOString().slice(0, 16)); setRescheduleStatus("scheduled"); setScheduleModal(true); }}
+                  className="text-xs px-3 py-1.5 rounded-lg font-bold border transition-colors" style={{ borderColor: t.primary + "60", color: t.primary, background: t.primary + "10" }}>
+                  ↻ Reschedule
+                </button>
+                <button onClick={() => setConfirmDeleteBulk(true)}
+                  className="text-xs px-3 py-1.5 rounded-lg font-bold transition-colors" style={{ background: t.dangerBg, color: t.danger }}>
+                  🗑 Delete
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {content.length === 0 && (
@@ -2644,17 +2806,24 @@ function ContentView({ brands, content, onView, onEdit, onDelete, onNew }: {
 
       <div className="space-y-2">
         {filtered.map(item => (
-          <Card key={item.id} className="p-4 cursor-pointer hover:shadow-md group relative"
-            onClick={() => onView(item.id)}
+          <Card key={item.id} className={`p-4 cursor-pointer hover:shadow-md group relative${bulkMode && selected.has(item.id) ? " ring-2 ring-offset-1" : ""}`}
+            style={{ "--tw-ring-color": t.primary } as React.CSSProperties}
+            onClick={() => (bulkMode ? toggleOne(item.id) : onView(item.id))}
             onMouseEnter={() => setHoverId(item.id)} onMouseLeave={() => setHoverId(null)}>
-            {hoverId === item.id && (
+            {bulkMode && (
+              <div className="absolute top-4 left-4 z-10" onClick={e => e.stopPropagation()}>
+                <input type="checkbox" checked={selected.has(item.id)} onChange={() => toggleOne(item.id)}
+                  className="w-4 h-4 accent-[#4f46e5] cursor-pointer" />
+              </div>
+            )}
+            {hoverId === item.id && !bulkMode && (
               <div className="absolute top-4 right-4 flex gap-1.5 z-10" onClick={e => e.stopPropagation()}>
                 <button onClick={() => onEdit(item.id)} className="text-xs px-2.5 py-1 rounded-lg font-semibold border" style={{ borderColor: t.border, color: t.textSub, background: t.card }}>Edit</button>
                 <button onClick={() => onDelete(item.id)} className="text-xs px-2.5 py-1 rounded-lg font-semibold border" style={{ borderColor: t.dangerBorder, color: t.danger, background: t.dangerBg+"40" }}>Delete</button>
               </div>
             )}
-            <div className="flex items-start gap-4 pr-20">
-              <BrandAvatar name={item.brand} color={item.brandColor} />
+            <div className={`flex items-start gap-4${bulkMode ? " pl-8" : " pr-20"}`}>
+              {!bulkMode && <BrandAvatar name={item.brand} color={item.brandColor} />}
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 mb-1 flex-wrap">
                   <span className="text-xs font-bold" style={{ color: item.brandColor }}>{item.brand}</span>
@@ -2678,6 +2847,44 @@ function ContentView({ brands, content, onView, onEdit, onDelete, onNew }: {
           <div className="text-center py-12 text-sm" style={{ color: t.textMuted }}>No items match your filters</div>
         )}
       </div>
+
+      {/* Reschedule modal */}
+      {scheduleModal && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center" style={{ background: t.overlay, backdropFilter: "blur(3px)" }} onClick={() => setScheduleModal(false)}>
+          <div className="w-full max-w-sm rounded-2xl border p-6 mx-4" style={{ background: t.modalBg, borderColor: t.border, boxShadow: t.shadowMd }} onClick={e => e.stopPropagation()}>
+            <div className="w-10 h-10 rounded-full flex items-center justify-center text-xl mb-4" style={{ background: t.tagBg }}>↻</div>
+            <div className="font-bold text-base mb-2" style={{ color: t.text }}>Reschedule {selectedIds.length} post{selectedIds.length === 1 ? "" : "s"}</div>
+            <p className="text-sm mb-4" style={{ color: t.textSub }}>Set the new publish date, time, and status for all selected items.</p>
+            <input type="datetime-local" value={rescheduleDate} onChange={e => setRescheduleDate(e.target.value)}
+              className="w-full text-sm px-3 py-2 rounded-lg border outline-none mb-3" style={{ background: t.inputBg, borderColor: t.border, color: t.text }} />
+            <select value={rescheduleStatus} onChange={e => setRescheduleStatus(e.target.value as Status)}
+              className="w-full text-sm px-3 py-2 rounded-lg border outline-none cursor-pointer mb-5" style={{ background: t.inputBg, borderColor: t.border, color: t.text }}>
+              {ALL_STATUSES.map(s => <option key={s} value={s}>{statusCfg(s, t).label}</option>)}
+            </select>
+            <div className="flex gap-3">
+              <button onClick={() => setScheduleModal(false)}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold border transition-colors" style={{ borderColor: t.border, color: t.textSub, background: t.card }}>
+                Cancel
+              </button>
+              <button onClick={applyReschedule} disabled={!rescheduleDate || selectedIds.length === 0}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-50" style={{ background: t.primary }}>
+                Apply
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete confirm */}
+      {confirmDeleteBulk && (
+        <ConfirmModal
+          open={confirmDeleteBulk}
+          onClose={() => setConfirmDeleteBulk(false)}
+          onConfirm={() => { onDeleteMany(selectedIds); clearSelection(); }}
+          title={`Delete ${selectedIds.length} post${selectedIds.length === 1 ? "" : "s"}?`}
+          message={`This will permanently remove ${selectedIds.length} item${selectedIds.length === 1 ? "" : "s"} from your content queue. This action cannot be undone.`}
+        />
+      )}
     </div>
   );
 }
@@ -2693,11 +2900,16 @@ function policyBadge(level: PolicyLevel, t: Theme) {
   return                         { label: "Human Approval",  color: "#dc2626", bg: t.mode==="light"?"#fee2e2":"#2d0f0f" };
 }
 
-function ApprovalView({ content, onStatusChange, onView }: {
-  content: ContentItem[]; onStatusChange: (id: number, s: Status) => void; onView: (id: number) => void;
+function ApprovalView({ content, onView, onApprove, onReject, onResubmit, onComment }: {
+  content: ContentItem[]; onView: (id: number) => void;
+  onApprove: (id: number, by: string, note?: string) => void;
+  onReject: (id: number, by: string, note?: string) => void;
+  onResubmit: (id: number, by: string) => void;
+  onComment: (id: number, by: string, text: string) => void;
 }) {
   const { t } = useTheme();
   const { user } = useAuth();
+  const userName = user?.name || "User";
 
   // ── Policy state (editable) ──
   const [policy, setPolicy] = useState<Array<{ type: string; level: PolicyLevel }>>(() => {
@@ -2759,19 +2971,20 @@ function ApprovalView({ content, onStatusChange, onView }: {
   };
 
   const bulkApprove = () => {
-    selected.forEach(id => onStatusChange(id, "approved"));
+    selected.forEach(id => onApprove(id, userName));
     setSelected(new Set());
   };
   const openBulkReject = () => { setRejectModal({ id: null, bulk: true }); setRejectNote(""); };
   const openReject = (id: number) => { setRejectModal({ id, bulk: false }); setRejectNote(""); };
   const confirmReject = () => {
     if (rejectModal.bulk) {
-      selected.forEach(id => onStatusChange(id, "draft"));
+      selected.forEach(id => onReject(id, userName, rejectNote));
       setSelected(new Set());
     } else if (rejectModal.id !== null) {
-      onStatusChange(rejectModal.id, "draft");
+      onReject(rejectModal.id, userName, rejectNote);
     }
     setRejectModal({ id: null, bulk: false });
+    setRejectNote("");
   };
 
   const tabCounts = { pending: pendingItems.length, approved: approvedItems.length, rejected: rejectedItems.length };
@@ -2988,6 +3201,59 @@ function ApprovalView({ content, onStatusChange, onView }: {
                                 <p className="text-sm leading-relaxed whitespace-pre-line" style={{ color: t.text }}>{item.videoScript}</p>
                               </div>
                             )}
+                            {tab === "pending" && (
+                              <div className="space-y-3">
+                                <div className="p-3 rounded-xl" style={{ background: t.sectionBg }}>
+                                  <div className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: t.textMuted }}>Approval Flow</div>
+                                  <div className="flex items-center">
+                                    {APPROVAL_STAGES.map((stage, i) => {
+                                      const stageNum = item.approvalStage ?? 0;
+                                      const isDone = i < stageNum;
+                                      const isActive = i === stageNum && stageNum < APPROVAL_STAGES.length;
+                                      return (
+                                        <div key={stage} className="flex items-center flex-1 last:flex-none">
+                                          <div className="flex flex-col items-center">
+                                            <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold" style={{ background: isDone ? "#10b981" : isActive ? t.primary : t.tagBg, color: isDone || isActive ? "white" : t.textFaint }}>
+                                              {isDone ? "✓" : i + 1}
+                                            </div>
+                                            <div className="mt-1 text-[9px] font-semibold whitespace-nowrap" style={{ color: isDone ? "#059669" : isActive ? t.primary : t.textMuted }}>{stage}</div>
+                                          </div>
+                                          {i < APPROVAL_STAGES.length - 1 && <div className="flex-1 h-0.5 mx-1 mb-4 rounded-full" style={{ background: isDone ? "#6ee7b7" : t.borderLight }} />}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                  <div className="mt-2 text-xs" style={{ color: t.textMuted }}>
+                                    {isFullyApproved(item.approvalStage ?? 0) ? "Fully approved ✓ — all sign-offs complete." : `Now awaiting: ${approvalStageLabel(item.approvalStage ?? 0)}`}
+                                  </div>
+                                </div>
+
+                                <div className="p-3 rounded-xl" style={{ background: t.sectionBg }}>
+                                  <div className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: t.textMuted }}>Comments &amp; History</div>
+                                  <div className="space-y-2 max-h-40 overflow-y-auto mb-2">
+                                    {(item.approvalLog ?? []).length === 0 ? (
+                                      <p className="text-xs" style={{ color: t.textMuted }}>No activity yet.</p>
+                                    ) : (item.approvalLog ?? []).slice(-8).map(en => {
+                                      const dot = en.action === "approved" ? "#059669" : en.action === "rejected" ? "#dc2626" : en.action === "commented" ? t.primary : "#d97706";
+                                      return (
+                                        <div key={en.id} className="flex items-start gap-2 text-xs">
+                                          <span className="w-1.5 h-1.5 rounded-full mt-1 flex-shrink-0" style={{ background: dot }} />
+                                          <div className="min-w-0">
+                                            <span className="font-semibold" style={{ color: t.text }}>{en.by}</span>{" "}
+                                            <span style={{ color: t.textMuted }}>
+                                              {en.action === "approved" ? `approved as ${en.stage}` : en.action === "rejected" ? `rejected at ${en.stage}` : en.action === "resubmitted" ? "resubmitted" : "commented"}
+                                              {" · "}{new Date(en.at).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"})}
+                                            </span>
+                                            {en.note && <p className="mt-0.5 leading-relaxed" style={{ color: t.text }}>{en.note}</p>}
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                  <CommentComposer onSend={text => onComment(item.id, userName, text)} theme={t} />
+                                </div>
+                              </div>
+                            )}
                             <div className="flex items-center justify-between pt-1">
                               <span className="text-xs" style={{ color: t.textMuted }}>
                                 Scheduled: {item.scheduled || "—"}
@@ -2998,18 +3264,18 @@ function ApprovalView({ content, onStatusChange, onView }: {
                                   <button onClick={() => openReject(item.id)}
                                     className="text-sm px-4 py-2 rounded-xl font-semibold border transition-all hover:shadow-sm"
                                     style={{ borderColor: t.dangerBorder, color: t.danger, background: t.card }}>✕ Reject</button>
-                                  <button onClick={() => onStatusChange(item.id, "approved")}
+                                  <button onClick={() => onApprove(item.id, userName)}
                                     className="text-sm px-4 py-2 rounded-xl font-bold text-white transition-all hover:opacity-90"
                                     style={{ background: "#059669" }}>✓ Approve</button>
                                 </div>
                               )}
                               {tab === "approved" && (
-                                <button onClick={() => onStatusChange(item.id, "review")}
+                                <button onClick={() => onResubmit(item.id, userName)}
                                   className="text-sm px-4 py-2 rounded-xl font-semibold border"
                                   style={{ borderColor: t.border, color: t.textSub, background: t.card }}>↩ Return to Review</button>
                               )}
                               {tab === "rejected" && (
-                                <button onClick={() => onStatusChange(item.id, "review")}
+                                <button onClick={() => onResubmit(item.id, userName)}
                                   className="text-sm px-4 py-2 rounded-xl font-bold text-white"
                                   style={{ background: "#d97706" }}>↩ Resubmit for Review</button>
                               )}
@@ -3024,7 +3290,7 @@ function ApprovalView({ content, onStatusChange, onView }: {
                           <button onClick={() => openReject(item.id)}
                             className="flex-1 py-1.5 rounded-lg text-xs font-semibold border transition-all"
                             style={{ borderColor: t.dangerBorder, color: t.danger, background: t.card }}>✕ Reject</button>
-                          <button onClick={() => onStatusChange(item.id, "approved")}
+                          <button onClick={() => onApprove(item.id, userName)}
                             className="flex-1 py-1.5 rounded-lg text-xs font-bold text-white transition-all hover:opacity-90"
                             style={{ background: "#059669" }}>✓ Approve</button>
                         </div>
@@ -3958,17 +4224,6 @@ function IntegrationsView({ integrations, onConfigure, apiKey, aiModel, onOpenSe
 
 // ─── Calendar helpers ─────────────────────────────────────────────────────────
 
-function parseScheduledDate(item: ContentItem): Date | null {
-  if (item.scheduledISO) { const d = new Date(item.scheduledISO); return isNaN(d.getTime()) ? null : d; }
-  if (!item.scheduled) return null;
-  const s = item.scheduled.replace(/—/, "").replace(/\s+/g, " ").trim();
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d;
-}
-const dateKey = (d: Date) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
-const addDays = (d: Date, n: number) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
-function getWeekStart(d: Date): Date { const day = d.getDay(); return addDays(d, day === 0 ? -6 : 1 - day); }
-
 const PLATFORM_NAME_MAP: Record<string, PlatformId> = {
   "Facebook":"facebook","Instagram":"instagram","X":"x","LinkedIn":"linkedin",
   "TikTok":"tiktok","YouTube":"youtube","Pinterest":"pinterest","Dev.to":"devto","WooCommerce":"woocommerce",
@@ -3981,7 +4236,25 @@ function getBrandChannel(brand: Brand | undefined, platform: string): BrandChann
   return brand.channels?.find(ch => ch.platformId === pid) ?? null;
 }
 
-async function publishToConnectedPlatform(item: ContentItem, channel: BrandChannel, defn: PlatformDef): Promise<{ success: boolean; message: string }> {
+/** True when the post's brand has this platform connected and configured. */
+function canPublishItem(item: ContentItem, brands: Brand[]): boolean {
+  const brand = brands.find(b => b.name === item.brand);
+  const channel = getBrandChannel(brand, item.platform);
+  return !!channel && channel.connected && !!PUBLISHING_DEFS.find(d => d.id === channel.platformId);
+}
+
+/**
+ * Publish one post through the PHP proxy (or a CORS-friendly direct API call).
+ * Never throws — a thrown error becomes a failed result so a bad channel can't
+ * abort the rest of the queue run.
+ */
+async function publishToConnectedPlatform(item: ContentItem, brands: Brand[]): Promise<{ success: boolean; message: string }> {
+  const brand = brands.find(b => b.name === item.brand);
+  const channel = getBrandChannel(brand, item.platform);
+  const defn = channel && PUBLISHING_DEFS.find(d => d.id === channel.platformId);
+  if (!channel || !defn) {
+    return { success: false, message: `${item.platform} not connected for ${item.brand} — configure in Brands → Publishing Channels.` };
+  }
   const c = channel.config;
 
   // Use proxy for platforms that are CORS-blocked from browser
@@ -4445,56 +4718,199 @@ Return ONLY a valid JSON array, no markdown:
 
 // ─── Publish Queue Panel ──────────────────────────────────────────────────────
 
+function queueTone(state: PublishState, t: Theme) {
+  switch (state) {
+    case "success":    return { color: t.success, bg: t.successBg, icon: "✓" };
+    case "failed":     return { color: t.danger, bg: t.dangerBg, icon: "✗" };
+    case "blocked":    return { color: t.statusReview.color, bg: t.statusReview.bg, icon: "⚠" };
+    case "publishing": return { color: t.statusApproved.color, bg: t.statusApproved.bg, icon: "◐" };
+    case "skipped":    return { color: t.textMuted, bg: t.tagBg, icon: "–" };
+    default:           return { color: t.textSub, bg: t.tagBg, icon: "◷" };
+  }
+}
+
 function PublishQueuePanel({ open, onClose, content, brands, onStatusChange, showToast }: {
   open: boolean; onClose: () => void; content: ContentItem[]; brands: Brand[];
   onStatusChange: (id: number, s: Status) => void; showToast: (msg: string) => void;
 }) {
   const { t } = useTheme();
-  const [publishing, setPublishing] = useState<Set<number>>(new Set());
-  const [results, setResults] = useState<Record<number,{success:boolean;message:string}>>({});
-  const [filter, setFilter] = useState<"due"|"all">("due");
-
-  useEffect(() => { if (open) setResults({}); }, [open]);
+  const [queue, setQueue] = useState<PublishEntry[]>([]);
+  const [filter, setFilter] = useState<PublishFilter>("due");
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState({ index: 0, total: 0 });
+  const [lastReport, setLastReport] = useState<PublishRunReport | null>(null);
+  const cancelRef = useRef({ cancelled: false });
+  const runLockRef = useRef(false);
+  const contentRef = useRef(content);
+  const brandsRef = useRef(brands);
+  useEffect(() => { contentRef.current = content; brandsRef.current = brands; }, [content, brands]);
 
   const now = new Date();
   const scheduled = content.filter(c => c.status === "scheduled");
-  const due = scheduled.filter(c => { const d = parseScheduledDate(c); return d && d <= now; });
-  const upcoming = scheduled.filter(c => { const d = parseScheduledDate(c); return !d || d > now; });
-  const displayed = filter === "due" ? due : scheduled;
+  const dueCount = scheduled.filter(c => { const d = parseScheduledDate(c); return !!d && d.getTime() <= now.getTime(); }).length;
+  const upcomingCount = scheduled.length - dueCount;
+  const failedCount = countByState(queue, "failed") + countByState(queue, "blocked");
+  const retryIds = retryableIds(queue);
 
-  const getConn = (item: ContentItem) => {
-    const brand = brands.find(b => b.name === item.brand);
-    const channel = getBrandChannel(brand, item.platform);
-    if (!channel) return null;
-    const defn = PUBLISHING_DEFS.find(d => d.id === channel.platformId);
-    return defn ? { defn, channel } : null;
-  };
+  // Re-derive the queue whenever the panel is open: new due posts are added,
+  // published posts drop out, and attempt history is preserved.
+  useEffect(() => {
+    if (!open) return;
+    setQueue(prev => buildQueue(prev, contentRef.current, new Date(), item => canPublishItem(item, brandsRef.current)));
+  }, [open, content, brands]);
 
-  const handlePublish = async (item: ContentItem) => {
-    setPublishing(p => new Set(p).add(item.id));
-    const conn = getConn(item);
-    let result: { success: boolean; message: string };
-    if (!conn?.channel.connected) {
-      result = { success: false, message: `${item.platform} not connected for ${item.brand} — configure in Brands → Publishing Channels.` };
-    } else {
-      result = await publishToConnectedPlatform(item, conn.channel, conn.defn);
+  // An auto-publish tick that failed while the panel is closed lands here so the
+  // queue keeps the failure instead of re-queuing the post on the next build.
+  useEffect(() => {
+    const onAutoPublishFailed = (e: Event) => {
+      const detail = (e as CustomEvent<{ itemId: number; message: string }>).detail;
+      if (!detail) return;
+      setQueue(prev => prev.map(en => en.itemId === detail.itemId && en.state !== "success" ? {
+        ...en,
+        state: "failed" as PublishState,
+        lastMessage: `Auto-publish failed: ${detail.message}`,
+        attempts: [...en.attempts, { attempt: en.attempts.length + 1, at: new Date().toISOString(), success: false, message: detail.message, blocked: false }],
+      } : en));
+    };
+    window.addEventListener("contentos:auto-publish-failed", onAutoPublishFailed);
+    return () => window.removeEventListener("contentos:auto-publish-failed", onAutoPublishFailed);
+  }, []);
+
+  const applyPatch = (p: PublishRunPatch) => {
+    switch (p.type) {
+      case "start":
+        setQueue(q => q.map(e => e.itemId === p.itemId ? { ...e, state: "publishing" } : e));
+        break;
+      case "attempt":
+        setQueue(q => q.map(e => e.itemId === p.itemId ? { ...e, ...p.outcome } : e));
+        break;
+      case "skip":
+        setQueue(q => q.map(e => e.itemId === p.itemId ? { ...e, state: "skipped" } : e));
+        break;
+      case "circuit":
+        setQueue(q => q.map(e => e.itemId === p.itemId ? { ...e, state: "skipped", lastMessage: p.message } : e));
+        break;
+      case "progress":
+        setProgress({ index: p.index, total: p.total });
+        break;
+      default:
+        break;
     }
-    setResults(r => ({ ...r, [item.id]: result }));
-    if (result.success) { onStatusChange(item.id, "published"); showToast(`Published to ${item.platform}`); }
-    setPublishing(p => { const n = new Set(p); n.delete(item.id); return n; });
   };
 
-  const handlePublishAll = async () => { for (const item of due) await handlePublish(item); };
+  /**
+   * Run the queue. No ids = every queued post (Publish All Due); ids = just those
+   * (retry, or a single post). An id that isn't queued yet (an upcoming post the
+   * user hit "Publish Now" on) gets a fresh row so a manual publish still works.
+   */
+  const runQueue = async (ids?: number[]) => {
+    if (runLockRef.current) return;
+    const single = ids !== undefined;
+    const targets = single
+      ? ids!
+          .map(id => queue.find(e => e.itemId === id) ?? enqueueNow(contentRef.current.find(c => c.id === id)))
+          .filter((e): e is PublishEntry => !!e && (e.state === "queued" || canRetry(e)))
+      : queue.filter(e => e.state === "queued");
+    if (targets.length === 0) return;
+
+    runLockRef.current = true;
+    setQueue(prev => [...resetEntries(prev, targets.map(e => e.itemId)), ...targets.filter(e => !prev.some(p => p.itemId === e.itemId))]);
+    setLastReport(null);
+    setRunning(true);
+    setProgress({ index: 0, total: targets.length });
+    const token = { cancelled: false };
+    cancelRef.current = token;
+
+    const report = await runPublishQueue(
+      { entries: targets, content: contentRef.current, onCancelToken: token },
+      {
+        canPublish: item => canPublishItem(item, brandsRef.current),
+        publish: item => publishToConnectedPlatform(item, brandsRef.current),
+        onPublished: (item, message) => {
+          onStatusChange(item.id, "published");
+          if (single) showToast(message);
+        },
+      },
+      applyPatch,
+    );
+
+    runLockRef.current = false;
+    setRunning(false);
+    setLastReport(report);
+    if (!single) showToast(summarizeReport(report));
+  };
+
+  const enqueueNow = (item: ContentItem | undefined): PublishEntry | null =>
+    item ? makeQueueEntry(item, canPublishItem(item, brandsRef.current)) : null;
+
+  const cancelRun = () => { cancelRef.current.cancelled = true; };
+  const clearFinished = () => setQueue(q => q.filter(e => e.state !== "success" && e.state !== "skipped"));
+
+  const upcoming = scheduled.filter(c => {
+    const d = parseScheduledDate(c);
+    return !d || d.getTime() > now.getTime();
+  });
+  const displayed: PublishEntry[] = filter === "failed"
+    ? queue.filter(e => e.state === "failed" || e.state === "blocked")
+    : queue;
+
+  const renderRow = (item: ContentItem, entry: PublishEntry | undefined) => {
+    const state: PublishState = entry?.state ?? "queued";
+    const tone = queueTone(state, t);
+    const d = parseScheduledDate(item);
+    const dateStr = d
+      ? d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + " at " + d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true })
+      : item.scheduled;
+    const attempts = entry?.attempts.length ?? 0;
+    const canRun = state === "queued" || canRetry(entry ?? { state: "queued", connected: false, attempts: [] });
+    return (
+      <div className="p-4 rounded-xl border" style={{ background: t.sectionBg, borderColor: state === "success" ? t.success : t.borderLight }}>
+        <div className="flex items-start gap-3 mb-2">
+          <BrandAvatar name={item.brand} color={item.brandColor} size="sm" />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-1.5 flex-wrap mb-1">
+              <span className="text-xs font-bold" style={{ color: item.brandColor }}>{item.brand}</span>
+              <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: t.tagBg, color: t.textSub }}>{item.platform}</span>
+              <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: t.tagBg, color: t.textSub }}>{item.format}</span>
+              <span className="text-xs ml-auto px-1.5 py-0.5 rounded-full font-semibold flex items-center gap-1"
+                style={{ background: tone.bg, color: tone.color }}>
+                {tone.icon} {publishStateLabel(state)}
+              </span>
+            </div>
+            <p className="text-xs leading-relaxed line-clamp-2" style={{ color: t.text }}>{item.caption}</p>
+            <div className="text-xs mt-1" style={{ color: t.textMuted }}>
+              {dateStr}
+              {attempts > 0 && ` · attempt ${attempts}/${MAX_PUBLISH_ATTEMPTS}`}
+            </div>
+          </div>
+        </div>
+        {entry?.lastMessage && (
+          <div className="text-xs px-3 py-2 rounded-lg mb-2" style={{ background: tone.bg, color: tone.color }}>
+            {tone.icon} {entry.lastMessage}
+          </div>
+        )}
+        <div className="flex justify-end gap-2">
+          {canRun && (
+            <button onClick={() => runQueue([item.id])} disabled={running}
+              className="text-xs font-bold px-4 py-2 rounded-lg text-white disabled:opacity-40 hover:opacity-90 transition-opacity"
+              style={{ background: state === "failed" ? t.danger : t.primary }}>
+              {running ? "Working…" : state === "publishing" ? "Publishing…" : state === "failed" ? "Retry" : "Publish Now"}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <SlidePanel open={open} onClose={onClose} title="Publish Queue"
-      subtitle={`${due.length} due now · ${upcoming.length} upcoming · ${scheduled.length} total scheduled`}>
+      subtitle={`${dueCount} due now · ${upcomingCount} upcoming · ${scheduled.length} total scheduled`}>
       <div className="space-y-5">
         <div className="grid grid-cols-3 gap-3">
           {[
-            { label:"Due Now",    value:due.length,      color:due.length>0?"#d97706":t.textMuted, bg:due.length>0?(t.mode==="light"?"#fef3c7":"#292110"):t.tagBg },
-            { label:"Upcoming",  value:upcoming.length,  color:"#059669", bg:t.mode==="light"?"#d1fae5":"#0a2218" },
-            { label:"Scheduled", value:scheduled.length, color:t.primary, bg:t.mode==="light"?"#eef2ff":"#1e2460" },
+            { label:"Due Now",    value:dueCount,      color:dueCount>0?"#d97706":t.textMuted, bg:dueCount>0?t.statusReview.bg:t.tagBg },
+            { label:"Upcoming",  value:upcomingCount,  color:t.success, bg:t.successBg },
+            { label:"Scheduled", value:scheduled.length, color:t.primary, bg:t.statusApproved.bg },
           ].map(s => (
             <div key={s.label} className="text-center p-3 rounded-xl" style={{ background: s.bg }}>
               <div className="text-2xl font-bold" style={{ color: s.color }}>{s.value}</div>
@@ -4503,69 +4919,76 @@ function PublishQueuePanel({ open, onClose, content, brands, onStatusChange, sho
           ))}
         </div>
 
+        {lastReport && (
+          <div className="flex items-center gap-2 text-xs px-3 py-2 rounded-lg"
+            style={{ background: t.tagBg, color: t.textSub }}>
+            <span>{summarizeReport(lastReport)}</span>
+            <button onClick={() => setLastReport(null)} className="ml-auto font-semibold hover:opacity-70">Dismiss</button>
+          </div>
+        )}
+
+        {running && (
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between text-xs" style={{ color: t.textSub }}>
+              <span>Publishing {Math.min(progress.index + 1, progress.total)} of {progress.total}…</span>
+              <button onClick={cancelRun} className="font-semibold" style={{ color: t.danger }}>Cancel</button>
+            </div>
+            <div className="h-1.5 rounded-full overflow-hidden" style={{ background: t.tagBg }}>
+              <div className="h-full rounded-full transition-all"
+                style={{ width: `${progress.total ? (progress.index / progress.total) * 100 : 0}%`, background: t.primary }} />
+            </div>
+          </div>
+        )}
+
         <div className="flex items-center gap-2">
-          <div className="flex gap-1.5">
-            {([["due",`Due (${due.length})`],["all",`All (${scheduled.length})`]] as const).map(([k,l]) => (
+          <div className="flex gap-1.5 flex-wrap">
+            {([["due",`Due (${dueCount})`],["all",`All (${scheduled.length})`],["failed",`Failed (${failedCount})`]] as [PublishFilter, string][]).map(([k,l]) => (
               <button key={k} onClick={() => setFilter(k)}
                 className="text-xs px-3 py-1.5 rounded-full border font-medium"
-                style={{ background: filter===k ? t.primary : t.tagBg, borderColor: filter===k ? t.primary : t.border, color: filter===k ? "white" : t.textSub }}>
+                style={{ background: filter===k ? t.primary : t.tagBg, borderColor: filter===k ? t.primary : t.border, color: filter===k ? t.primaryText : t.textSub }}>
                 {l}
               </button>
             ))}
           </div>
-          {due.length > 0 && (
-            <button onClick={handlePublishAll}
-              className="ml-auto text-xs font-bold px-4 py-2 rounded-lg text-white hover:opacity-90 transition-opacity"
-              style={{ background: "#059669" }}>
-              Publish All Due
-            </button>
-          )}
+          <div className="ml-auto flex items-center gap-2">
+            {(queue.some(e => e.state === "success" || e.state === "skipped")) && (
+              <button onClick={clearFinished}
+                className="text-xs font-semibold px-3 py-2 rounded-lg border"
+                style={{ borderColor: t.border, color: t.textSub, background: t.card }}>
+                Clear finished
+              </button>
+            )}
+            {retryIds.length > 0 && (
+              <button onClick={() => runQueue(retryIds)} disabled={running}
+                className="text-xs font-bold px-4 py-2 rounded-lg text-white disabled:opacity-40 hover:opacity-90 transition-opacity"
+                style={{ background: t.danger }}>
+                Retry {retryIds.length} Failed
+              </button>
+            )}
+            {filter !== "failed" && (
+              <button onClick={() => runQueue()} disabled={running || dueCount === 0}
+                className="text-xs font-bold px-4 py-2 rounded-lg text-white disabled:opacity-40 hover:opacity-90 transition-opacity"
+                style={{ background: t.success }}>
+                Publish All Due
+              </button>
+            )}
+          </div>
         </div>
 
         <div className="space-y-3">
-          {displayed.length === 0 && (
+          {filter === "all" && upcoming.map(item => (
+            <div key={item.id} className="opacity-70">{renderRow(item, undefined)}</div>
+          ))}
+          {(filter === "all" ? displayed.length + upcoming.length : displayed.length) === 0 && (
             <div className="text-center py-12 text-sm" style={{ color: t.textMuted }}>
-              {filter === "due" ? "No posts due right now" : "No scheduled posts"}
+              {filter === "failed" ? "No failures — the queue is clean"
+                : filter === "due" ? "No posts due right now"
+                : "No scheduled posts"}
             </div>
           )}
-          {displayed.map(item => {
-            const conn = getConn(item);
-            const connected = conn?.channel.connected ?? false;
-            const isPub = publishing.has(item.id);
-            const result = results[item.id];
-            const d = parseScheduledDate(item);
-            const dateStr = d ? d.toLocaleDateString("en-US",{month:"short",day:"numeric"}) + " at " + d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit",hour12:true}) : item.scheduled;
-            return (
-              <div key={item.id} className="p-4 rounded-xl border" style={{ background: t.sectionBg, borderColor: result?.success ? "#6ee7b7" : t.borderLight }}>
-                <div className="flex items-start gap-3 mb-2">
-                  <BrandAvatar name={item.brand} color={item.brandColor} size="sm" />
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-1.5 flex-wrap mb-1">
-                      <span className="text-xs font-bold" style={{ color: item.brandColor }}>{item.brand}</span>
-                      <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: t.tagBg, color: t.textSub }}>{item.platform}</span>
-                      <span className="text-xs px-1.5 py-0.5 rounded" style={{ background: t.tagBg, color: t.textSub }}>{item.format}</span>
-                      {connected
-                        ? <span className="text-xs ml-auto flex items-center gap-1" style={{ color:"#059669" }}><span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" />Connected</span>
-                        : <span className="text-xs ml-auto" style={{ color: t.textMuted }}>Not connected</span>}
-                    </div>
-                    <p className="text-xs leading-relaxed line-clamp-2" style={{ color: t.text }}>{item.caption}</p>
-                    <div className="text-xs mt-1" style={{ color: t.textMuted }}>{dateStr}</div>
-                  </div>
-                </div>
-                {result && (
-                  <div className="text-xs px-3 py-2 rounded-lg mb-2" style={{ background: result.success?(t.mode==="light"?"#d1fae5":"#0a2218"):t.dangerBg, color: result.success?"#059669":t.danger }}>
-                    {result.success ? "✓" : "✗"} {result.message}
-                  </div>
-                )}
-                <div className="flex justify-end">
-                  <button onClick={() => handlePublish(item)} disabled={isPub || result?.success}
-                    className="text-xs font-bold px-4 py-2 rounded-lg text-white disabled:opacity-40 hover:opacity-90 transition-opacity"
-                    style={{ background: result?.success ? "#059669" : t.primary }}>
-                    {isPub ? "Publishing…" : result?.success ? "✓ Published" : "Publish Now"}
-                  </button>
-                </div>
-              </div>
-            );
+          {displayed.map(entry => {
+            const item = content.find(c => c.id === entry.itemId);
+            return item ? <div key={entry.itemId}>{renderRow(item, entry)}</div> : null;
           })}
         </div>
       </div>
@@ -4575,13 +4998,15 @@ function PublishQueuePanel({ open, onClose, content, brands, onStatusChange, sho
 
 // ─── Calendar View ────────────────────────────────────────────────────────────
 
-function CalendarView({ brands, content, integrations, apiKey, aiModel, onAddContent, onViewPost, onStatusChange, showToast }: {
+function CalendarView({ brands, content, integrations, apiKey, aiModel, onAddContent, onViewPost, onStatusChange, showToast, autoPublish, onToggleAutoPublish }: {
   brands: Brand[]; content: ContentItem[]; integrations: Integration[];
   apiKey: string; aiModel: string;
   onAddContent: (items: Omit<ContentItem,"id"|"score">[]) => void;
   onViewPost: (id: number) => void;
   onStatusChange: (id: number, s: Status) => void;
   showToast: (msg: string) => void;
+  autoPublish: boolean;
+  onToggleAutoPublish: () => void;
 }) {
   const { t } = useTheme();
   const [mode, setMode] = useState<"month"|"week">("month");
@@ -4610,6 +5035,12 @@ function CalendarView({ brands, content, integrations, apiKey, aiModel, onAddCon
           <p className="text-sm mt-0.5" style={{ color: t.textSub }}>{filtered.length} posts across all brands</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          <button onClick={onToggleAutoPublish}
+            className="flex items-center gap-1.5 text-sm font-semibold px-3 py-2 rounded-lg border"
+            style={{ borderColor: autoPublish?"#059669":t.border, color: autoPublish?"#059669":t.textSub, background: autoPublish?(t.mode==="light"?"#d1fae5":"#0a2218"):t.card }}>
+            <span className={`w-2 h-2 rounded-full inline-block${autoPublish?" animate-pulse":""}`} style={{ background: autoPublish?"#059669":t.textFaint }} />
+            Auto-publish{autoPublish ? " ON" : " OFF"}
+          </button>
           <button onClick={() => setPublishOpen(true)}
             className="flex items-center gap-1.5 text-sm font-semibold px-3 py-2 rounded-lg border"
             style={{ borderColor: dueCount>0?"#d97706":t.border, color: dueCount>0?"#d97706":t.textSub, background: dueCount>0?(t.mode==="light"?"#fef3c7":"#292110"):t.card }}>
@@ -5583,6 +6014,135 @@ export default function App() {
       catch (e) { showToast(apiErr(e)); }
     }
   };
+
+  // Multi-stage approval: queues a log entry + advanced status, then persists.
+  const handleApprovalAction = async (id: number, action: "approve" | "reject" | "resubmit" | "comment", by: string, note?: string) => {
+    const item = content.find(c => c.id === id);
+    if (!item) return;
+    const st = { stage: item.approvalStage ?? 0, log: item.approvalLog ?? [] };
+    let next: ContentItem;
+    let toastMsg = "";
+    if (action === "approve") {
+      const res = approveStage(st, by, note);
+      next = { ...item, status: res.done ? "approved" : "review", approvalStage: res.state.stage, approvalLog: res.state.log };
+      toastMsg = res.done ? "Post fully approved ✓" : `${by} approved — awaiting ${approvalStageLabel(res.state.stage)}`;
+    } else if (action === "reject") {
+      const r = rejectStage(st, by, note);
+      next = { ...item, status: "draft" as Status, approvalStage: r.stage, approvalLog: r.log };
+      toastMsg = "Post rejected → Draft";
+    } else if (action === "resubmit") {
+      const r = resubmitStage(st, by);
+      next = { ...item, status: "review" as Status, approvalStage: r.stage, approvalLog: r.log };
+      toastMsg = "Post resubmitted for review";
+    } else {
+      const r = addComment(st, by, note ?? "");
+      next = { ...item, approvalStage: r.stage, approvalLog: r.log };
+    }
+    persistContent(content.map(c => c.id === id ? next : c));
+    setContent(cs => cs.map(c => c.id === id ? next : c));
+    if (toastMsg) showToast(toastMsg);
+    const token = getToken();
+    if (token) {
+      try { await apiUpdateContent(token, id, { status: next.status, approvalStage: next.approvalStage, approvalLog: next.approvalLog }); }
+      catch (e) { showToast(apiErr(e)); }
+    }
+  };
+
+  const handleDeleteManyContent = async (ids: number[]) => {
+    const token = getToken();
+    setContent(cs => { const next = cs.filter(c => !ids.includes(c.id)); persistContent(next); return next; });
+    const n = ids.length;
+    showToast(`${n} post${n === 1 ? "" : "s"} deleted`);
+    if (token) {
+      for (const id of ids) {
+        try { await apiDeleteContent(token, id); }
+        catch (e) { showToast(apiErr(e)); }
+      }
+    }
+  };
+
+  const handleStatusManyContent = async (ids: number[], s: Status) => {
+    const token = getToken();
+    setContent(cs => {
+      const next = cs.map(c => ids.includes(c.id) ? { ...c, status: s } : c);
+      persistContent(next);
+      return next;
+    });
+    const n = ids.length;
+    showToast(`${n} post${n === 1 ? "" : "s"} → ${statusCfg(s, t).label}`);
+    if (token) {
+      for (const id of ids) {
+        try { await apiUpdateContent(token, id, { status: s }); }
+        catch (e) { showToast(apiErr(e)); }
+      }
+    }
+  };
+
+  const handleRescheduleManyContent = async (ids: number[], scheduled: string, scheduledISO: string) => {
+    const token = getToken();
+    setContent(cs => {
+      const next = cs.map(c => ids.includes(c.id) ? { ...c, scheduled, scheduledISO } : c);
+      persistContent(next);
+      return next;
+    });
+    const n = ids.length;
+    showToast(`${n} post${n === 1 ? "" : "s"} rescheduled`);
+    if (token) {
+      for (const id of ids) {
+        try { await apiUpdateContent(token, id, { scheduled, scheduledISO }); }
+        catch (e) { showToast(apiErr(e)); }
+      }
+    }
+  };
+
+  // ── Auto-publish loop ──
+  // Ticks once on mount, then every 45s. Publishes any post due at-or-before
+  // now for brands with a connected publishing channel.
+  const [autoPublish, setAutoPublish] = useState<boolean>(() => localStorage.getItem("contentOS_autoPublish") !== "off");
+  const contentRef = useRef<ContentItem[]>(content);
+  const brandsRef = useRef<Brand[]>(brands);
+  useEffect(() => { contentRef.current = content; }, [content]);
+  useEffect(() => { brandsRef.current = brands; }, [brands]);
+
+  const toggleAutoPublish = () => {
+    setAutoPublish(a => {
+      localStorage.setItem("contentOS_autoPublish", a ? "off" : "on");
+      return !a;
+    });
+  };
+
+  useEffect(() => {
+    if (!autoPublish) return;
+    let cancelled = false;
+    const inFlight = new Set<number>();
+    const tick = async () => {
+      if (cancelled || inFlight.size > 0) return;
+      try {
+        await runAutoPublish(contentRef.current, new Date(), inFlight, {
+          findChannel: (item) => {
+            const brand = brandsRef.current.find(b => b.name === item.brand);
+            return getBrandChannel(brand, item.platform);
+          },
+          findDef: (channel) => PUBLISHING_DEFS.find(d => d.id === channel.platformId) ?? null,
+          publish: item => publishToConnectedPlatform(item, brandsRef.current),
+          onPublished: (item) => {
+            handleStatusChange(item.id, "published");
+            showToast(`Auto-published to ${item.platform} ✓`);
+          },
+          onFailed: (item, _defn, message) => {
+            showToast(`Auto-publish failed: ${message}`);
+            window.dispatchEvent(new CustomEvent("contentos:auto-publish-failed", { detail: { itemId: item.id, message } }));
+          },
+          isCancelled: () => cancelled,
+        });
+      } catch {
+        /* one bad tick shouldn't kill the timer */
+      }
+    };
+    tick();
+    const timer = setInterval(tick, 45_000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [autoPublish]);
   const handleAddMultipleContent = async (items: Omit<ContentItem,"id"|"score">[]) => {
     const token = getToken();
     if (token) {
@@ -5638,9 +6198,18 @@ export default function App() {
               onView={id => setViewPostId(id)}
               onEdit={id => { setEditPostId(id); setContentFormOpen(true); }}
               onDelete={id => { const c = content.find(x=>x.id===id); setConfirmDelete({ type:"content", id, name: c?.brand||"Post" }); }}
-              onNew={() => { setEditPostId(0); setContentFormOpen(true); }} />
+              onNew={() => { setEditPostId(0); setContentFormOpen(true); }}
+              onDeleteMany={handleDeleteManyContent}
+              onStatusMany={handleStatusManyContent}
+              onRescheduleMany={handleRescheduleManyContent} />
           )}
-          {view === "approval"     && <ApprovalView content={content} onStatusChange={handleStatusChange} onView={id => setViewPostId(id)} />}
+          {view === "approval"     && (
+            <ApprovalView content={content} onView={id => setViewPostId(id)}
+              onApprove={(id, by, note) => handleApprovalAction(id, "approve", by, note)}
+              onReject={(id, by, note) => handleApprovalAction(id, "reject", by, note)}
+              onResubmit={(id, by) => handleApprovalAction(id, "resubmit", by)}
+              onComment={(id, by, text) => handleApprovalAction(id, "comment", by, text)} />
+          )}
           {view === "analytics"    && <AnalyticsView brands={brands} content={content} />}
           {view === "integrations" && <IntegrationsView integrations={integrations} onConfigure={id => setConfigPanelId(id)} apiKey={apiKey} aiModel={aiModel} onOpenSettings={() => setSettingsOpen(true)} brands={brands} onViewBrand={id => setViewBrandId(id)} />}
           {view === "calendar"     && (
@@ -5651,6 +6220,8 @@ export default function App() {
               onViewPost={id => setViewPostId(id)}
               onStatusChange={handleStatusChange}
               showToast={showToast}
+              autoPublish={autoPublish}
+              onToggleAutoPublish={toggleAutoPublish}
             />
           )}
           {view === "team" && <TeamGate />}
@@ -5665,6 +6236,9 @@ export default function App() {
             onEdit={() => { setEditPostId(viewPost.id); setViewPostId(null); setContentFormOpen(true); }}
             onDelete={() => { const id = viewPost.id; setViewPostId(null); const c = content.find(x=>x.id===id); setConfirmDelete({ type:"content", id, name: c?.brand||"Post" }); }}
             onStatusChange={s => handleStatusChange(viewPost.id, s)}
+            onApprove={(by, note) => handleApprovalAction(viewPost.id, "approve", by, note)}
+            onReject={(by, note) => handleApprovalAction(viewPost.id, "reject", by, note)}
+            onComment={(by, text) => handleApprovalAction(viewPost.id, "comment", by, text)}
           />
         )}
 

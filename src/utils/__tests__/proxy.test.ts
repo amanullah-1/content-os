@@ -15,6 +15,7 @@ describe("shouldUseProxy", () => {
     expect(shouldUseProxy("tiktok")).toBe(true);
     expect(shouldUseProxy("youtube")).toBe(true);
     expect(shouldUseProxy("pinterest")).toBe(true);
+    expect(shouldUseProxy("x")).toBe(true);
   });
 
   it("returns false for direct platforms", () => {
@@ -28,8 +29,9 @@ describe("shouldUseProxy", () => {
 });
 
 describe("PROXY_REQUIRED_PLATFORMS", () => {
-  it("contains 7 platforms", () => {
-    expect(PROXY_REQUIRED_PLATFORMS.size).toBe(7);
+  it("contains 8 platforms", () => {
+    expect(PROXY_REQUIRED_PLATFORMS.size).toBe(8);
+    expect(PROXY_REQUIRED_PLATFORMS.has("x")).toBe(true);
   });
 });
 

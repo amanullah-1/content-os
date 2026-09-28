@@ -29,6 +29,13 @@ function item_shape(array $r): array
         'format' => $r['format'],
         'score' => $r['score'] === null ? 0 : (int) $r['score'],
     ];
+    if (!empty($r['approval_state'])) {
+        $st = json_decode((string) $r['approval_state'], true);
+        if (is_array($st)) {
+            if (isset($st['stage'])) $out['approvalStage'] = (int) $st['stage'];
+            if (isset($st['log']) && is_array($st['log'])) $out['approvalLog'] = $st['log'];
+        }
+    }
     foreach (['image_prompt' => 'imagePrompt', 'video_script' => 'videoScript',
               'image_url' => 'generatedImageUrl', 'video_url' => 'generatedVideoUrl'] as $col => $key) {
         if ($r[$col] !== null && $r[$col] !== '') $out[$key] = $r[$col];
@@ -37,6 +44,15 @@ function item_shape(array $r): array
         $out['scheduledISO'] = str_replace(' ', 'T', (string) $r['scheduled_at']);
     }
     return $out;
+}
+
+/** Encode frontend approval fields ({approvalStage, approvalLog}) → JSON column, or null. */
+function approval_state_json(array $in): ?string
+{
+    $stage = (int) ($in['approvalStage'] ?? 0);
+    $log = $in['approvalLog'] ?? null;
+    if ($stage === 0 && ($log === null || $log === [])) return null;
+    return json_encode(['stage' => $stage, 'log' => is_array($log) ? array_values($log) : []], JSON_UNESCAPED_UNICODE);
 }
 
 /** Resolve a brand NAME to an accessible brand id (null = unknown or no access). */
@@ -58,7 +74,11 @@ function parse_dt(?string $v): ?string
 
 try {
     $pdo = db();
+    $method = $_SERVER['REQUEST_METHOD'];
     $user = require_auth();
+
+    ensure_audit_log_table($pdo);
+    rate_limit_by_user($user['id'], 130, 60);
     $method = $_SERVER['REQUEST_METHOD'];
 
     if ($method === 'GET') {
@@ -95,8 +115,9 @@ try {
             'INSERT INTO `content_items`
              (`brand_id`, `campaign`, `pillar`, `platform`, `status`, `caption`, `hashtags`,
               `scheduled_label`, `scheduled_at`, `format`, `score`,
-              `image_prompt`, `video_script`, `image_url`, `video_url`, `created_by`)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+              `image_prompt`, `video_script`, `image_url`, `video_url`, `created_by`,
+              `approval_state`)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
         );
         $stmt->execute([
             $brandId, (string) ($in['campaign'] ?? ''), (string) ($in['pillar'] ?? ''),
@@ -108,6 +129,7 @@ try {
             $in['imagePrompt'] ?? null, $in['videoScript'] ?? null,
             $in['generatedImageUrl'] ?? null, $in['generatedVideoUrl'] ?? null,
             $user['id'],
+            approval_state_json($in),
         ]);
         $id = (int) $pdo->lastInsertId();
         $stmt = $pdo->prepare(
@@ -116,6 +138,9 @@ try {
              WHERE c.`id` = ?'
         );
         $stmt->execute([$id]);
+        audit_log($pdo, $user['id'], 'content.created', 'content', $id, [
+            'brand_id' => $brandId, 'status' => $status, 'platform' => (string) ($in['platform'] ?? ''),
+        ]);
         respond(item_shape($stmt->fetch()), 201);
     }
 
@@ -155,6 +180,8 @@ try {
             'video_script' => $in['videoScript'] ?? $existing['video_script'],
             'image_url' => $in['generatedImageUrl'] ?? $existing['image_url'],
             'video_url' => $in['generatedVideoUrl'] ?? $existing['video_url'],
+            'approval_state' => array_key_exists('approvalStage', $in) || array_key_exists('approvalLog', $in)
+                ? (approval_state_json($in) ?? null) : $existing['approval_state'],
         ];
         $sets = implode(', ', array_map(fn($c) => "`$c` = ?", array_keys($cols)));
         $params = array_values($cols);
@@ -166,11 +193,15 @@ try {
              WHERE c.`id` = ?'
         );
         $stmt->execute([$id]);
+        audit_log($pdo, $user['id'], 'content.updated', 'content', $id, [
+            'brand_id' => $brandId, 'status' => $status, 'platform' => (string) ($in['platform'] ?? ''),
+        ]);
         respond(item_shape($stmt->fetch()));
     }
 
     if ($method === 'DELETE') {
         $pdo->prepare('DELETE FROM `content_items` WHERE `id` = ?')->execute([$id]);
+        audit_log($pdo, $user['id'], 'content.deleted', 'content', $id, []);
         respond(['success' => true]);
     }
 
