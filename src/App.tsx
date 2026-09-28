@@ -9,6 +9,7 @@ import {
   type ServerUser, type TeamUser,
 } from "./api";
 import { proxyPublish, shouldUseProxy } from "./utils/proxy";
+import { verifyFacebookChannel } from "./utils/facebook";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { validate, emailRule, passwordRule, validatePasswordMatch } from "./utils/validation";
 import {
@@ -18,7 +19,7 @@ import {
   type ApprovalLogEntry,
 } from "./utils/approval";
 import { runAutoPublish } from "./utils/auto-publish";
-import { addDays, dateKey, getWeekStart, parseScheduledDate } from "./utils/calendar-helpers";
+import { addDays, dateKey, formatScheduledLabel, getWeekStart, parseScheduledDate, toDatetimeLocalValue } from "./utils/calendar-helpers";
 import {
   buildQueue, canRetry, countByState, makeQueueEntry, publishStateLabel, resetEntries,
   retryableIds, runPublishQueue, summarizeReport,
@@ -210,6 +211,8 @@ interface ContentItem {
   generatedVideoUrl?: string;
   approvalStage?: number;
   approvalLog?: ApprovalLogEntry[];
+  externalPostId?: string;
+  publishedAt?: string;
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
@@ -1145,6 +1148,15 @@ function SettingsPanel({ open, onClose, apiKey, onApiKeyChange, aiModel, onModel
 const IMAGE_FORMATS = new Set(["Image","Carousel","Story"]);
 const VIDEO_FORMATS = new Set(["Reel","Video"]);
 
+// Quick-pick offsets for the schedule picker. `at` is a function so each render
+// resolves relative to "now" rather than to when this module was evaluated.
+const SCHEDULE_PRESETS: { label: string; at: () => Date }[] = [
+  { label: "In 1 hour",   at: () => new Date(Date.now() + 3_600_000) },
+  { label: "Tonight 7pm", at: () => { const d = new Date(); d.setHours(19, 0, 0, 0); if (d <= new Date()) d.setDate(d.getDate() + 1); return d; } },
+  { label: "Tomorrow 9am",at: () => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(9, 0, 0, 0); return d; } },
+  { label: "In 1 week",   at: () => new Date(Date.now() + 7 * 86_400_000) },
+];
+
 type GeneratedContent = {
   caption: string;
   hashtags: string;
@@ -1614,6 +1626,24 @@ function ContentFormPanel({ item, brands, open, onClose, onSave, apiKey, aiModel
   const selectedBrand = brands.find(b => b.name === form.brand);
   const pillars = selectedBrand?.pillars.map(p => p.name).filter(Boolean) || [];
 
+  // Prefill the picker from scheduledISO, falling back to the label for rows
+  // saved before the picker existed.
+  const scheduleValue = toDatetimeLocalValue(parseScheduledDate({ ...form, id: 0, score: 0 }));
+  // Writing both the ISO and the label keeps the calendar, the queue and
+  // auto-publish all agreeing, and stops "scheduled with no date" from recurring.
+  const applySchedule = (value: string) => {
+    if (!value) { setForm(f => ({ ...f, scheduled: "", scheduledISO: "" })); return; }
+    const d = new Date(value);
+    if (isNaN(d.getTime())) return;
+    setForm(f => ({
+      ...f,
+      scheduledISO: d.toISOString(),
+      scheduled: formatScheduledLabel(d),
+      // Only promote an approved post; never skip the approval gate for drafts.
+      status: f.status === "approved" ? "scheduled" : f.status,
+    }));
+  };
+
   const isImage = IMAGE_FORMATS.has(form.format);
   const isVideo = VIDEO_FORMATS.has(form.format);
 
@@ -1883,7 +1913,39 @@ function ContentFormPanel({ item, brands, open, onClose, onSave, apiKey, aiModel
           {fieldErrors.caption && <p className="text-xs mt-1" style={{ color: t.danger }}>{fieldErrors.caption}</p>}
         </div>
         <Input label="Hashtags" value={form.hashtags} onChange={v => set("hashtags", v)} placeholder="#tag1 #tag2 #tag3" />
-        <Input label="Scheduled Date & Time" value={form.scheduled} onChange={v => set("scheduled", v)} placeholder="Sep 4, 2026 — 7:30 PM" />
+        <div>
+          <label className="block text-xs font-semibold mb-1.5" style={{ color: t.textSub }}>Scheduled Date &amp; Time</label>
+          <input
+            type="datetime-local"
+            value={scheduleValue}
+            onChange={e => applySchedule(e.target.value)}
+            className="w-full text-sm px-3 py-2.5 rounded-lg border outline-none"
+            style={{ background: t.inputBg, borderColor: t.border, color: t.text }}
+          />
+          <div className="flex flex-wrap gap-1.5 mt-2">
+            {SCHEDULE_PRESETS.map(p => (
+              <button key={p.label} type="button" onClick={() => applySchedule(toDatetimeLocalValue(p.at()))}
+                className="text-xs px-2.5 py-1 rounded-lg font-medium border"
+                style={{ borderColor: t.border, color: t.textSub, background: t.card }}>
+                {p.label}
+              </button>
+            ))}
+            {form.scheduled && (
+              <button type="button" onClick={() => applySchedule("")}
+                className="text-xs px-2.5 py-1 rounded-lg font-medium"
+                style={{ color: t.danger, background: t.dangerBg + "50" }}>
+                Clear
+              </button>
+            )}
+          </div>
+          {form.scheduled && (
+            <p className="text-xs mt-2" style={{ color: t.textMuted }}>
+              {form.status === "approved"
+                ? `Will auto-publish ${form.scheduled}. Use Publish now to post it immediately instead.`
+                : `Target: ${form.scheduled}. Set the status to Scheduled to arm auto-publish, or approve it and post it right away.`}
+            </p>
+          )}
+        </div>
 
         <div>
           <label className="block text-xs font-semibold mb-2" style={{ color: t.textSub }}>Status</label>
@@ -2106,8 +2168,7 @@ function PostDetailPanel({ post, onClose, onEdit, onDelete, onStatusChange, onAp
               </div>
 
               <div className="p-3 rounded-xl border" style={{ background: t.sectionBg, borderColor: t.borderLight }}>
-                <div className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: t.textMuted }}>Activity</div>
-                <div className="space-y-2 max-h-36 overflow-y-auto mb-2">
+                <div className="text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: t.textMuted }}>Activity</div>                <div className="space-y-2 max-h-36 overflow-y-auto mb-2">
                   {(post.approvalLog ?? []).length === 0 ? (
                     <p className="text-xs" style={{ color: t.textMuted }}>No approval activity yet.</p>
                   ) : (post.approvalLog ?? []).slice(-6).map(en => {
@@ -2136,6 +2197,20 @@ function PostDetailPanel({ post, onClose, onEdit, onDelete, onStatusChange, onAp
                   {isFullyApproved(post.approvalStage ?? 0) ? "✓ Approve" : `✓ Approve as ${approvalStageLabel(post.approvalStage ?? 0)}`}
                 </button>
               </div>
+            </div>
+          )}
+          {post.status === "published" && (
+            <div className="px-3 py-2.5 rounded-xl border text-xs" style={{ background: "#05966914", borderColor: "#05966940" }}>
+              <div className="font-semibold" style={{ color: "#059669" }}>✓ Published to {post.platform}</div>
+              {post.publishedAt && (
+                <div className="mt-0.5" style={{ color: t.textMuted }}>at {new Date(post.publishedAt).toLocaleString()}</div>
+              )}
+              {post.externalPostId && (
+                <div className="mt-0.5 font-mono break-all" style={{ color: t.textSub }}>Post ID: {post.externalPostId}</div>
+              )}
+              {!post.externalPostId && (
+                <div className="mt-0.5" style={{ color: t.textMuted }}>Published before post IDs were recorded.</div>
+              )}
             </div>
           )}
           {(post.status === "approved" || post.status === "scheduled") && (
@@ -2167,6 +2242,8 @@ function BrandChannelPanel({ brand, onClose, onSave }: {
   const [configForm, setConfigForm] = useState<Record<string, string>>({});
   const [showSecrets, setShowSecrets] = useState<Record<string, boolean>>({});
   const [guideOpen, setGuideOpen] = useState(true);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyResult, setVerifyResult] = useState<{ ok: boolean; text: string; hint?: string } | null>(null);
 
   const getChannel = (pid: PlatformId) => channels.find(c => c.platformId === pid) ?? { platformId: pid, connected: false, config: {} };
 
@@ -2175,6 +2252,27 @@ function BrandChannelPanel({ brand, onClose, onSave }: {
     setConfigForm({ ...getChannel(pid).config });
     setShowSecrets({});
     setGuideOpen(!getChannel(pid).connected);
+    setVerifyResult(null);
+  };
+
+  // Resolve a real page-scoped token and confirm the page is reachable. A pasted
+  // token is usually a user token: it can publish, but it cannot read the page,
+  // so without this check a dead connection looks identical to a live one.
+  const verifyChannel = async () => {
+    if (!editing) return;
+    setVerifying(true);
+    setVerifyResult(null);
+    try {
+      const res = await verifyFacebookChannel(configForm);
+      if (res.success && res.pageToken) {
+        setConfigForm(f => ({ ...f, accessToken: res.pageToken as string }));
+        setVerifyResult({ ok: true, text: `Connected as ${res.pageName || res.pageId} — page token saved.` });
+      } else {
+        setVerifyResult({ ok: false, text: res.message || "Verification failed.", hint: res.hint });
+      }
+    } finally {
+      setVerifying(false);
+    }
   };
 
   const saveChannel = () => {
@@ -2304,6 +2402,17 @@ function BrandChannelPanel({ brand, onClose, onSave }: {
                   </div>
                 ))}
 
+                {verifyResult && (
+                  <div className="px-3 py-2.5 rounded-xl border text-xs" style={{
+                    background: verifyResult.ok ? "#05966914" : t.dangerBg + "60",
+                    borderColor: verifyResult.ok ? "#05966940" : t.dangerBorder,
+                    color: verifyResult.ok ? "#059669" : t.danger,
+                  }}>
+                    <div className="font-semibold">{verifyResult.ok ? "✓ " : "✕ "}{verifyResult.text}</div>
+                    {verifyResult.hint && <div className="mt-1 font-normal" style={{ color: t.textMuted }}>{verifyResult.hint}</div>}
+                  </div>
+                )}
+
                 {/* Field completion indicator */}
                 <div className="flex items-center gap-2 px-3 py-2.5 rounded-xl border" style={{ background: t.sectionBg, borderColor: allFilled ? defn.color + "40" : t.borderLight }}>
                   <div className="flex gap-1.5 flex-wrap flex-1">
@@ -2318,6 +2427,13 @@ function BrandChannelPanel({ brand, onClose, onSave }: {
 
                 {/* Actions */}
                 <div className="flex gap-2 pt-1">
+                  {editing === "facebook" && (
+                    <button type="button" onClick={verifyChannel} disabled={verifying || !configForm.pageId?.trim() || !configForm.accessToken?.trim()}
+                      className="px-4 py-2.5 rounded-xl text-sm font-semibold border disabled:opacity-40"
+                      style={{ borderColor: t.border, color: t.textSub, background: t.card }}>
+                      {verifying ? "Verifying…" : "Verify connection"}
+                    </button>
+                  )}
                   {ch.connected && (
                     <button onClick={() => { disconnectChannel(editing); setEditing(null); }}
                       className="px-4 py-2.5 rounded-xl text-sm font-semibold border"
@@ -2711,13 +2827,15 @@ function BrandsView({ brands, onView, onEdit, onDelete, onNew }: {
 
 // ─── Content View ─────────────────────────────────────────────────────────────
 
-function ContentView({ brands, content, onView, onEdit, onDelete, onNew, onDeleteMany, onStatusMany, onRescheduleMany }: {
+function ContentView({ brands, content, onView, onEdit, onDelete, onNew, onDeleteMany, onStatusMany, onRescheduleMany, onPublish, publishingId }: {
   brands: Brand[]; content: ContentItem[]; onView: (id: number) => void;
   onEdit: (id: number) => void; onDelete: (id: number) => void; onNew: () => void;
   onDeleteMany: (ids: number[]) => void;
   onStatusMany: (ids: number[], s: Status) => void;
   onRescheduleMany: (ids: number[], scheduled: string, scheduledISO: string) => void;
-}) {
+  onPublish?: (item: ContentItem) => void;
+  publishingId?: number | null;
+  }) {
   const { t } = useTheme();
   const [filter, setFilter] = useState<"all" | Status>("all");
   const [brandFilter, setBrandFilter] = useState("all");
@@ -2859,11 +2977,18 @@ function ContentView({ brands, content, onView, onEdit, onDelete, onNew, onDelet
             )}
             {hoverId === item.id && !bulkMode && (
               <div className="absolute top-4 right-4 flex gap-1.5 z-10" onClick={e => e.stopPropagation()}>
+                {(item.status === "approved" || item.status === "scheduled") && onPublish && (
+                  <button onClick={() => onPublish(item)} disabled={publishingId === item.id}
+                    className="text-xs px-2.5 py-1 rounded-lg font-semibold text-white disabled:opacity-60"
+                    style={{ background: "#4f46e5" }}>
+                    {publishingId === item.id ? "Publishing…" : "Publish now"}
+                  </button>
+                )}
                 <button onClick={() => onEdit(item.id)} className="text-xs px-2.5 py-1 rounded-lg font-semibold border" style={{ borderColor: t.border, color: t.textSub, background: t.card }}>Edit</button>
                 <button onClick={() => onDelete(item.id)} className="text-xs px-2.5 py-1 rounded-lg font-semibold border" style={{ borderColor: t.dangerBorder, color: t.danger, background: t.dangerBg+"40" }}>Delete</button>
               </div>
             )}
-            <div className={`flex items-start gap-4${bulkMode ? " pl-8" : " pr-20"}`}>
+            <div className={`flex items-start gap-4${bulkMode ? " pl-8" : " pr-52"}`}>
               {!bulkMode && <BrandAvatar name={item.brand} color={item.brandColor} />}
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 mb-1 flex-wrap">
@@ -4289,7 +4414,7 @@ function canPublishItem(item: ContentItem, brands: Brand[]): boolean {
  * Never throws — a thrown error becomes a failed result so a bad channel can't
  * abort the rest of the queue run.
  */
-async function publishToConnectedPlatform(item: ContentItem, brands: Brand[]): Promise<{ success: boolean; message: string }> {
+async function publishToConnectedPlatform(item: ContentItem, brands: Brand[]): Promise<{ success: boolean; message: string; externalId?: string; publishedAt?: string }> {
   const brand = brands.find(b => b.name === item.brand);
   const channel = getBrandChannel(brand, item.platform);
   const defn = channel && PUBLISHING_DEFS.find(d => d.id === channel.platformId);
@@ -4300,7 +4425,7 @@ async function publishToConnectedPlatform(item: ContentItem, brands: Brand[]): P
 
   // Use proxy for platforms that are CORS-blocked from browser
   if (shouldUseProxy(defn.id)) {
-    return proxyPublish({
+    const res = await proxyPublish({
       platform: defn.id,
       config: c,
       content: {
@@ -4310,6 +4435,12 @@ async function publishToConnectedPlatform(item: ContentItem, brands: Brand[]): P
         pillar: item.pillar,
       },
     });
+    return {
+      success: res.success,
+      message: res.message,
+      externalId: res.external_id,
+      publishedAt: res.published_at,
+    };
   }
 
   // Direct browser calls only for CORS-friendly platforms (Dev.to)
@@ -4323,7 +4454,7 @@ async function publishToConnectedPlatform(item: ContentItem, brands: Brand[]): P
       });
       const data = await res.json() as { id?: number; error?: string };
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-      return { success: true, message: `Published to Dev.to — Article #${data.id}` };
+      return { success: true, message: `Published to Dev.to — Article #${data.id}`, externalId: data.id ? String(data.id) : undefined, publishedAt: new Date().toISOString() };
     }
     return { success: true, message: `Marked as published on ${defn.name} (browser-direct API not available for this platform)` };
   } catch (e) {
@@ -4770,10 +4901,12 @@ function queueTone(state: PublishState, t: Theme) {
   }
 }
 
-function PublishQueuePanel({ open, onClose, content, brands, onStatusChange, showToast }: {
+function PublishQueuePanel({ open, onClose, content, brands, onStatusChange, onPublished, showToast }: {
   open: boolean; onClose: () => void; content: ContentItem[]; brands: Brand[];
-  onStatusChange: (id: number, s: Status) => void; showToast: (msg: string) => void;
-}) {
+  onStatusChange: (id: number, s: Status) => void;
+  onPublished?: (item: ContentItem, externalId?: string, publishedAt?: string) => void | Promise<void>;
+  showToast: (msg: string) => void;
+  }) {
   const { t } = useTheme();
   const [queue, setQueue] = useState<PublishEntry[]>([]);
   const [filter, setFilter] = useState<PublishFilter>("due");
@@ -4866,7 +4999,11 @@ function PublishQueuePanel({ open, onClose, content, brands, onStatusChange, sho
       { entries: targets, content: contentRef.current, onCancelToken: token },
       {
         canPublish: item => canPublishItem(item, brandsRef.current),
-        publish: item => publishToConnectedPlatform(item, brandsRef.current),
+        publish: async item => {
+          const res = await publishToConnectedPlatform(item, brandsRef.current);
+          if (res.success) await onPublished?.(item, res.externalId, res.publishedAt);
+          return res;
+        },
         onPublished: (item, message) => {
           onStatusChange(item.id, "published");
           if (single) showToast(message);
@@ -5039,12 +5176,13 @@ function PublishQueuePanel({ open, onClose, content, brands, onStatusChange, sho
 
 // ─── Calendar View ────────────────────────────────────────────────────────────
 
-function CalendarView({ brands, content, integrations, apiKey, aiModel, onAddContent, onViewPost, onStatusChange, showToast, autoPublish, onToggleAutoPublish }: {
+function CalendarView({ brands, content, integrations, apiKey, aiModel, onAddContent, onViewPost, onStatusChange, onPublished, showToast, autoPublish, onToggleAutoPublish }: {
   brands: Brand[]; content: ContentItem[]; integrations: Integration[];
   apiKey: string; aiModel: string;
   onAddContent: (items: Omit<ContentItem,"id"|"score">[]) => void;
   onViewPost: (id: number) => void;
   onStatusChange: (id: number, s: Status) => void;
+  onPublished?: (item: ContentItem, externalId?: string, publishedAt?: string) => void;
   showToast: (msg: string) => void;
   autoPublish: boolean;
   onToggleAutoPublish: () => void;
@@ -5137,7 +5275,7 @@ function CalendarView({ brands, content, integrations, apiKey, aiModel, onAddCon
       {mode === "week"  && <WeekCalendar  content={filtered} currentDate={currentDate} onPostClick={onViewPost} />}
 
       <GenerateSchedulePanel open={generateOpen} onClose={() => setGenerateOpen(false)} brands={brands} apiKey={apiKey} aiModel={aiModel} integrations={integrations} onSchedule={onAddContent} />
-      <PublishQueuePanel open={publishOpen} onClose={() => setPublishOpen(false)} content={content} brands={brands} onStatusChange={onStatusChange} showToast={showToast} />
+        <PublishQueuePanel open={publishOpen} onClose={() => setPublishOpen(false)} content={content} brands={brands} onStatusChange={onStatusChange} onPublished={onPublished} showToast={showToast} />
     </div>
   );
 }
@@ -6073,6 +6211,31 @@ export default function App() {
     }
   };
 
+  // Record a confirmed publish: status plus the platform's own post id/timestamp
+  // so a published post can be proven later instead of inferred from the status.
+  const recordPublished = async (item: ContentItem, externalId?: string, publishedAt?: string) => {
+    const patch: Partial<ContentItem> = { status: "published" };
+    if (externalId) patch.externalPostId = externalId;
+    patch.publishedAt = publishedAt || new Date().toISOString();
+    setContent(cs => {
+      const next = cs.map(c => (c.id === item.id ? { ...c, ...patch } : c));
+      persistContent(next);
+      return next;
+    });
+    const token = getToken();
+    if (token) {
+      try {
+        await apiUpdateContent(token, item.id, {
+          status: patch.status,
+          externalPostId: patch.externalPostId,
+          publishedAt: patch.publishedAt,
+        });
+      } catch (e) {
+        showToast(apiErr(e));
+      }
+    }
+  };
+
   // Publish a single post immediately, bypassing the queue's due-date gate.
   const [publishingId, setPublishingId] = useState<number | null>(null);
   const handlePublishNow = async (item: ContentItem) => {
@@ -6080,7 +6243,7 @@ export default function App() {
     try {
       const res = await publishToConnectedPlatform(item, brands);
       if (res.success) {
-        await handleStatusChange(item.id, "published");
+        await recordPublished(item, res.externalId, res.publishedAt);
         showToast(res.message);
       } else {
         showToast(`Publish failed: ${res.message}`);
@@ -6176,8 +6339,10 @@ export default function App() {
   const [autoPublish, setAutoPublish] = useState<boolean>(() => localStorage.getItem("contentOS_autoPublish") !== "off");
   const contentRef = useRef<ContentItem[]>(content);
   const brandsRef = useRef<Brand[]>(brands);
+  const recordPublishedRef = useRef(recordPublished);
   useEffect(() => { contentRef.current = content; }, [content]);
   useEffect(() => { brandsRef.current = brands; }, [brands]);
+  useEffect(() => { recordPublishedRef.current = recordPublished; }, [recordPublished]);
 
   const toggleAutoPublish = () => {
     setAutoPublish(a => {
@@ -6199,12 +6364,15 @@ export default function App() {
             return getBrandChannel(brand, item.platform);
           },
           findDef: (channel) => PUBLISHING_DEFS.find(d => d.id === channel.platformId) ?? null,
-          publish: item => publishToConnectedPlatform(item, brandsRef.current),
+          publish: async item => {
+            const res = await publishToConnectedPlatform(item, brandsRef.current);
+            if (res.success) recordPublishedRef.current(item, res.externalId, res.publishedAt);
+            return res;
+          },
           onPublished: (item) => {
             handleStatusChange(item.id, "published");
             showToast(`Auto-published to ${item.platform} ✓`);
-          },
-          onFailed: (item, _defn, message) => {
+          },          onFailed: (item, _defn, message) => {
             showToast(`Auto-publish failed: ${message}`);
             window.dispatchEvent(new CustomEvent("contentos:auto-publish-failed", { detail: { itemId: item.id, message } }));
           },
@@ -6276,7 +6444,9 @@ export default function App() {
               onNew={() => { setEditPostId(0); setContentFormOpen(true); }}
               onDeleteMany={handleDeleteManyContent}
               onStatusMany={handleStatusManyContent}
-              onRescheduleMany={handleRescheduleManyContent} />
+              onRescheduleMany={handleRescheduleManyContent}
+              onPublish={handlePublishNow}
+              publishingId={publishingId} />
           )}
           {view === "approval"     && (
             <ApprovalView content={content} onView={id => setViewPostId(id)}
@@ -6294,6 +6464,7 @@ export default function App() {
               onAddContent={handleAddMultipleContent}
               onViewPost={id => setViewPostId(id)}
               onStatusChange={handleStatusChange}
+              onPublished={recordPublished}
               showToast={showToast}
               autoPublish={autoPublish}
               onToggleAutoPublish={toggleAutoPublish}

@@ -3,9 +3,11 @@ import type { ContentItem } from "@/types";
 const MONTHS: Record<string, number> = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
 
 // Accepts "Sep 15, 2026 - 7:30 PM", "Sep 15, 2026 7:30 PM", "Sep 28 12:51 PM",
-// "Sep 15 2026". The year is optional and defaults to the current year: without
-// it the engine assumes 2001, which makes a post look decades overdue.
-const SCHED_RE = /^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:\s*,?\s*(\d{4}))?(?:\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm])?)?/;
+// "Sep 15 2026" and the comma-separated "Sep 28, 2026, 7:30 PM" that
+// toLocaleString produces. The year is optional and defaults to the current
+// year: without it the engine assumes 2001, which makes a post look decades
+// overdue. The time separator may be a space, a comma, or both.
+const SCHED_RE = /^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:\s*,?\s*(\d{4}))?(?:\s*,?\s*(\d{1,2}):(\d{2})\s*([AaPp][Mm])?)?/;
 
 export function parseScheduledDate(item: ContentItem): Date | null {
   if (item.scheduledISO) {
@@ -39,6 +41,20 @@ export function parseScheduledDate(item: ContentItem): Date | null {
 
 export function dateKey(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** Format a Date the way schedule labels are stored and displayed. */
+export function formatScheduledLabel(d: Date): string {
+  return d.toLocaleString("en-US", {
+    month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit",
+  });
+}
+
+/** Value for an <input type="datetime-local">, which expects local wall-clock time. */
+export function toDatetimeLocalValue(d: Date | null): string {
+  if (!d || isNaN(d.getTime())) return "";
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 export function addDays(d: Date, n: number): Date {

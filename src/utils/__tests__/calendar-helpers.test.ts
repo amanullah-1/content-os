@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseScheduledDate, dateKey, addDays, getWeekStart, getDueScheduledPosts } from "../calendar-helpers";
+import { parseScheduledDate, dateKey, addDays, getWeekStart, getDueScheduledPosts, formatScheduledLabel, toDatetimeLocalValue } from "../calendar-helpers";
 import type { ContentItem } from "@/types";
 
 function makeItem(overrides: Partial<ContentItem> = {}): ContentItem {
@@ -80,6 +80,15 @@ describe("parseScheduledDate", () => {
     expect(parseScheduledDate(makeItem({ scheduled: "Sep 15, 2026 - 7:30 PM" }))).toBeInstanceOf(Date);
   });
 
+  it("accepts a comma before the time, as toLocaleString emits", () => {
+    // Regression: the label produced by formatScheduledLabel / toLocaleString
+    // is "Sep 28, 2026, 7:30 PM" and the time was silently dropped to midnight.
+    const d = parseScheduledDate(makeItem({ scheduled: "Sep 28, 2026, 7:30 PM" }))!;
+    expect(d.getFullYear()).toBe(2026);
+    expect(d.getHours()).toBe(19);
+    expect(d.getMinutes()).toBe(30);
+  });
+
 
   it("parses scheduled string without em dash", () => {
     const item = makeItem({ scheduled: "Sep 15, 2026 7:30 PM" });
@@ -143,21 +152,21 @@ describe("addDays", () => {
 
 describe("getWeekStart", () => {
   it("returns Monday for a Wednesday", () => {
-    const d = new Date(2026, 8, 2); // Sep 2, 2026 — Wednesday
+    const d = new Date(2026, 8, 2); // Sep 2, 2026 â€” Wednesday
     const start = getWeekStart(d);
     expect(start.getDay()).toBe(1); // Monday
     expect(start.getDate()).toBe(31); // Aug 31
   });
 
   it("returns same day if Monday", () => {
-    const d = new Date(2026, 8, 7); // Sep 7, 2026 — Monday
+    const d = new Date(2026, 8, 7); // Sep 7, 2026 â€” Monday
     const start = getWeekStart(d);
     expect(start.getDay()).toBe(1);
     expect(start.getDate()).toBe(7);
   });
 
   it("returns previous Monday if Sunday", () => {
-    const d = new Date(2026, 8, 6); // Sep 6, 2026 — Sunday
+    const d = new Date(2026, 8, 6); // Sep 6, 2026 â€” Sunday
     const start = getWeekStart(d);
     expect(start.getDay()).toBe(1);
     expect(start.getDate()).toBe(31); // Aug 31
@@ -216,5 +225,39 @@ describe("getDueScheduledPosts", () => {
 
   it("returns empty when no posts", () => {
     expect(getDueScheduledPosts([], now, () => true)).toEqual([]);
+  });
+});
+
+describe("schedule picker helpers", () => {
+  it("round-trips a local wall-clock value through the picker", () => {
+    const d = new Date(2026, 8, 28, 19, 30); // 28 Sep 2026, 19:30 local
+    const value = toDatetimeLocalValue(d);
+    expect(value).toBe("2026-09-28T19:30");
+    // Feeding the picker value back must yield the same instant.
+    expect(new Date(value).getTime()).toBe(d.getTime());
+  });
+
+  it("pads single-digit month, day, hour and minute", () => {
+    expect(toDatetimeLocalValue(new Date(2026, 0, 5, 7, 5))).toBe("2026-01-05T07:05");
+  });
+
+  it("returns an empty value for missing or invalid dates", () => {
+    expect(toDatetimeLocalValue(null)).toBe("");
+    expect(toDatetimeLocalValue(new Date("nope"))).toBe("");
+  });
+
+  it("formats a label that parseScheduledDate can read back", () => {
+    const d = new Date(2026, 8, 28, 19, 30);
+    const label = formatScheduledLabel(d);
+    expect(label).toContain("2026");
+    const round = parseScheduledDate({ id: 1, brand: "B", brandColor: "#fff", campaign: "", pillar: "",
+      platform: "Facebook", status: "scheduled", caption: "", hashtags: "", scheduled: label,
+      format: "Post", score: 0 });
+    expect(round).toBeInstanceOf(Date);
+    expect(round!.getFullYear()).toBe(2026);
+    expect(round!.getMonth()).toBe(8);
+    expect(round!.getDate()).toBe(28);
+    expect(round!.getHours()).toBe(19);
+    expect(round!.getMinutes()).toBe(30);
   });
 });
