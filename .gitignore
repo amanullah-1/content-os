@@ -12,6 +12,13 @@ logs/
 .claude-replay.*
 .tmp-*
 
+# Runtime-only state, recreated on demand by api/logger.php and
+# api/ratelimit.php (both mkdir it themselves). Holds daily log files and
+# the rate_limits.sqlite fallback DB, which must never be committed.
+# The 'logs/' rule above already covered storage/logs, but not the
+# SQLite file or its -wal/-shm sidecars.
+/storage/
+
 # Platform-managed agentplat state, not project source. In the
 # client-initiated single-repo workspace layout (make's `Path: "."` spec) the
 # repo root IS the workspace root, so these land inside this repo rather than

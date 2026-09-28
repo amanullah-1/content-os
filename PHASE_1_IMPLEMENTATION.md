@@ -156,16 +156,18 @@ mysql -u root contented < api/migrations/002_add_content_templates.sql
 mysql -u root contented < api/migrations/003_add_approval_state.sql
 mysql -u root contented < api/migrations/004_add_publish_provenance.sql
 
-# 3. Writable storage for logs
-mkdir -p storage/logs
-
-# 4. Frontend
+# 3. Frontend
 npm install
 npm run build
 ```
 
-`storage/` is not currently listed in `.gitignore`. `storage/logs` is empty and untracked, but
-add it to `.gitignore` so log files cannot be committed by accident.
+Step "writable storage" is optional. `api/logger.php:38` and `api/ratelimit.php:38` each
+`mkdir(0755, true)` the directories they need, so a fresh clone works without it.
+
+`storage/` is ignored in `.gitignore`. It holds only runtime state — daily log files and the
+`rate_limits.sqlite` fallback database (plus its `-wal`/`-shm` sidecars) — and is recreated on
+demand. Note the earlier `logs/` rule also covered `storage/logs/`, but not the SQLite file, which
+is why the whole directory is now ignored explicitly.
 
 ---
 
