@@ -1214,17 +1214,38 @@ async function callPollinationsText(apiKey: string, model: string, prompt: strin
   return text;
 }
 
+// Hugging Face retired the legacy host api-inference.huggingface.co — it no
+// longer resolves in DNS, which surfaces in the browser as a bare
+// "NetworkError when attempting to fetch resource" rather than an HTTP error.
+// All inference now goes through the router.
+const HF_ROUTER = "https://router.huggingface.co";
+// Pinned to Hugging Face's own tier, which since July 2025 is mostly CPU. Only
+// use for legacy pipeline models; chat models must go through HF_ROUTER below.
+const HF_INFERENCE = `${HF_ROUTER}/hf-inference`;
+
 async function callHuggingFaceText(apiToken: string, model: string, prompt: string, system?: string): Promise<string> {
   const messages = [
     ...(system ? [{ role: "system", content: system }] : []),
     { role: "user", content: prompt },
   ];
-  // Try chat-completions endpoint first (newer hosted models)
-  const chatRes = await fetch(`https://api-inference.huggingface.co/models/${model}/v1/chat/completions`, {
+  const headers = { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" };
+  const chat = (m: string) => fetch(`${HF_ROUTER}/v1/chat/completions`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, max_tokens: 8000, stream: false }),
+    headers,
+    body: JSON.stringify({ model: m, messages, max_tokens: 8000, stream: false }),
   });
+
+  // Do NOT pin the provider in the path (…/hf-inference/models/{model}/v1/…).
+  // That selects Hugging Face's own CPU tier, which serves almost no chat
+  // models and answers HTTP 400 "Model not supported by provider
+  // hf-inference". The router picks a partner provider that actually has it.
+  //
+  // A ":cheapest" suffix picks the least expensive provider — free accounts
+  // only get $0.10 of credits a month, so this is the sensible default. If
+  // that provider is unavailable, retry with the router's own choice.
+  const suffix = model.includes(":") ? "" : ":cheapest";
+  let chatRes = await chat(model + suffix);
+  if (!chatRes.ok && suffix) chatRes = await chat(model);
   if (chatRes.ok) {
     const data = await chatRes.json() as { choices?: { message?: { content?: string } }[] };
     const text = data.choices?.[0]?.message?.content;
@@ -1232,14 +1253,15 @@ async function callHuggingFaceText(apiToken: string, model: string, prompt: stri
   }
   // Fall back to standard inference API (older / pipeline models)
   const fullPrompt = `${system ? system + "\n\n" : ""}${messages.map(m => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`).join("\n")}\nAssistant:`;
-  const inferRes = await fetch(`https://api-inference.huggingface.co/models/${model}`, {
+  const inferRes = await fetch(`${HF_INFERENCE}/models/${model}`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({ inputs: fullPrompt, parameters: { max_new_tokens: 8000, return_full_text: false } }),
   });
   if (!inferRes.ok) {
     const e = await inferRes.json().catch(() => ({})) as { error?: string };
     if (e.error?.includes("loading")) throw new Error("Model is loading on Hugging Face — wait ~30s and try again.");
+    if (/not supported by provider/i.test(e.error || "")) throw new Error(`${model} is not served by Hugging Face's own tier and is not available on the router either — pick a different model.`);
     throw new Error(e.error || `Hugging Face HTTP ${inferRes.status}`);
   }
   const result = await inferRes.json() as { generated_text?: string }[] | { generated_text?: string };
@@ -1297,13 +1319,16 @@ const SCHEDULE_PROVIDERS = [
     name: "Hugging Face",
     icon: "🤗",
     color: "#f59e0b",
-    desc: "Free inference API — open-source Llama, Mistral, Qwen models",
+    desc: "Router access to open-weight Llama, Qwen, DeepSeek, GPT-OSS",
     requiresKey: true,
+    // Every id below was verified to return 200 through
+    // router.huggingface.co/v1/chat/completions. Note the Llama id has no
+    // "Meta-" prefix — meta-llama/Meta-Llama-3.1-8B-Instruct does not exist.
     models: [
-      { id: "meta-llama/Meta-Llama-3.1-8B-Instruct", label: "Llama 3.1 8B",  desc: "Fast & free" },
-      { id: "meta-llama/Llama-3.1-70B-Instruct",     label: "Llama 3.1 70B", desc: "Higher quality" },
-      { id: "mistralai/Mistral-7B-Instruct-v0.3",    label: "Mistral 7B",    desc: "Efficient" },
-      { id: "Qwen/Qwen2.5-72B-Instruct",             label: "Qwen 2.5 72B",  desc: "Multilingual" },
+      { id: "Qwen/Qwen2.5-72B-Instruct",   label: "Qwen 2.5 72B",  desc: "Multilingual" },
+      { id: "meta-llama/Llama-3.1-8B-Instruct", label: "Llama 3.1 8B", desc: "Fast" },
+      { id: "deepseek-ai/DeepSeek-V3-0324", label: "DeepSeek V3",   desc: "Strong reasoning" },
+      { id: "openai/gpt-oss-120b",         label: "GPT-OSS 120B",  desc: "Open weights, slow" },
     ],
   },
 ] as const;
@@ -1412,23 +1437,31 @@ async function generateImageHuggingFace(apiToken: string, prompt: string, model?
   const modelId = model?.trim() || "black-forest-labs/FLUX.1-schnell";
   let res: Response;
   try {
-    res = await fetch(`https://api-inference.huggingface.co/models/${modelId}`, {
+    res = await fetch(`${HF_INFERENCE}/models/${modelId}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json", "x-wait-for-model": "true" },
       body: JSON.stringify({ inputs: prompt }),
     });
   } catch (e) {
-    // fetch() rejected at the network layer — Firefox reports this as
-    // "NetworkError when attempting to fetch resource". This is not a bad key
-    // (the Test probe already validated it); it's the browser being blocked from
-    // reaching the inference host. Best fix: use a keyless browser-friendly provider.
-    throw new Error("Could not reach Hugging Face — the free inference host can reject browser requests or is cold-loading the model. Use Stable Horde (keyless) or your fal.ai/Hugging Face paid endpoint instead.");
+    // fetch() rejected at the network layer (Firefox surfaces this as
+    // "NetworkError when attempting to fetch resource"). The host resolves, so
+    // this is not the retired api-inference.huggingface.co any more — it is
+    // DNS/TLS, an ad blocker, or CORS on the router.
+    throw new Error("Could not reach the Hugging Face router — check your connection, VPN, or content blocker. Stable Horde (keyless) is a fallback.");
   }
   if (!res.ok) {
     const e = await res.json().catch(() => ({})) as { error?: string };
-    if (e.error?.includes("loading")) throw new Error("Hugging Face model is loading — try again in ~20 seconds.");
+    const msg = e.error || "";
+    if (msg.includes("loading")) throw new Error("Hugging Face model is loading — try again in ~20 seconds.");
     if (res.status === 401 || res.status === 403) throw new Error("Hugging Face rejected the token (HTTP " + res.status + "). Check the key in Integrations.");
-    throw new Error(e.error || `Hugging Face HTTP ${res.status}`);
+    // Text-to-image on Hugging Face's own tier is effectively retired: the
+    // default FLUX.1-schnell now answers HTTP 410 "deprecated and no longer
+    // supported by provider hf-inference", and the unpinned route 404s. Point
+    // people at the providers that do still serve images.
+    if (res.status === 410 || /deprecat|not supported by provider|not found/i.test(msg)) {
+      throw new Error("Hugging Face no longer serves image models on its free tier. Use fal.ai or Replicate for images (both are in Integrations), or Stable Horde which is keyless and free.");
+    }
+    throw new Error(msg || `Hugging Face HTTP ${res.status}`);
   }
   const blob = await res.blob();
   return URL.createObjectURL(blob);
@@ -1904,12 +1937,13 @@ function CommentComposer({ onSend, theme }: { onSend: (text: string) => void; th
   );
 }
 
-function PostDetailPanel({ post, onClose, onEdit, onDelete, onStatusChange, onApprove, onReject, onComment }: {
+function PostDetailPanel({ post, onClose, onEdit, onDelete, onStatusChange, onApprove, onReject, onComment, onPublishNow, publishing }: {
   post: ContentItem; onClose: () => void; onEdit: () => void;
   onDelete: () => void; onStatusChange: (s: Status) => void;
   onApprove: (by: string, note?: string) => void;
   onReject: (by: string, note?: string) => void;
   onComment: (by: string, text: string) => void;
+  onPublishNow: () => void; publishing?: boolean;
 }) {
   const { t } = useTheme();
   const { user } = useAuth();
@@ -2104,10 +2138,17 @@ function PostDetailPanel({ post, onClose, onEdit, onDelete, onStatusChange, onAp
               </div>
             </div>
           )}
-          {post.status === "approved" && (
-            <button onClick={() => onStatusChange("scheduled")} className="w-full py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-90" style={{ background:"#059669" }}>
-              Schedule Post →
-            </button>
+          {(post.status === "approved" || post.status === "scheduled") && (
+            <div className="flex gap-2">
+              <button onClick={() => onStatusChange("scheduled")} className="flex-1 py-2.5 rounded-xl text-sm font-semibold border transition-colors" style={{ borderColor: t.border, color: t.textSub, background: t.card }}>
+                {parseScheduledDate(post) ? "Reschedule" : "Schedule Post →"}
+              </button>
+              <button onClick={onPublishNow} disabled={publishing}
+                className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-60"
+                style={{ background: "#4f46e5" }}>
+                {publishing ? "Publishing…" : "Publish now"}
+              </button>
+            </div>
           )}
         </div>
       </div>
@@ -6006,12 +6047,46 @@ export default function App() {
     }
   };
   const handleStatusChange = async (id: number, s: Status) => {
-    setContent(cs => { const next = cs.map(c => c.id === id ? { ...c, status: s } : c); persistContent(next); return next; });
+    // Moving a post to "scheduled" without giving it a date strands it: the
+    // publish queue and auto-publish both go through parseScheduledDate, which
+    // returns null with no date, so the post is silently unreachable. Stamp
+    // "now" so it becomes immediately due and publishable.
+    let patch: { scheduled?: string; scheduledISO?: string } = {};
+    const current = content.find(c => c.id === id);
+    if (s === "scheduled" && current && parseScheduledDate(current) === null) {
+      const now = new Date();
+      patch = {
+        scheduledISO: now.toISOString(),
+        scheduled: now.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }),
+      };
+    }
+    setContent(cs => {
+      const next = cs.map(c => c.id === id ? { ...c, status: s, ...patch } : c);
+      persistContent(next);
+      return next;
+    });
     showToast(`Status → ${statusCfg(s, t).label}`);
     const token = getToken();
     if (token) {
-      try { await apiUpdateContent(token, id, { status: s }); }
+      try { await apiUpdateContent(token, id, { status: s, ...patch }); }
       catch (e) { showToast(apiErr(e)); }
+    }
+  };
+
+  // Publish a single post immediately, bypassing the queue's due-date gate.
+  const [publishingId, setPublishingId] = useState<number | null>(null);
+  const handlePublishNow = async (item: ContentItem) => {
+    setPublishingId(item.id);
+    try {
+      const res = await publishToConnectedPlatform(item, brands);
+      if (res.success) {
+        await handleStatusChange(item.id, "published");
+        showToast(res.message);
+      } else {
+        showToast(`Publish failed: ${res.message}`);
+      }
+    } finally {
+      setPublishingId(null);
     }
   };
 
@@ -6239,6 +6314,8 @@ export default function App() {
             onApprove={(by, note) => handleApprovalAction(viewPost.id, "approve", by, note)}
             onReject={(by, note) => handleApprovalAction(viewPost.id, "reject", by, note)}
             onComment={(by, text) => handleApprovalAction(viewPost.id, "comment", by, text)}
+            onPublishNow={() => handlePublishNow(viewPost)}
+            publishing={publishingId === viewPost.id}
           />
         )}
 
