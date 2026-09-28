@@ -19,6 +19,10 @@ interface ProxyPayload {
 interface ProxyResult {
   success: boolean;
   message: string;
+  /** Platform post id (e.g. Facebook "PAGEID_POSTID") when the platform returns one. */
+  external_id?: string;
+  /** ISO timestamp set by the proxy at the moment of a confirmed publish. */
+  published_at?: string;
 }
 
 export async function proxyPublish(payload: ProxyPayload): Promise<ProxyResult> {

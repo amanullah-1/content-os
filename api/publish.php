@@ -75,10 +75,13 @@ function fail(string $message): void
     exit;
 }
 
-/** @return array{success:bool,message:string} */
-function ok(string $message): array
+/**
+ * @param array<string,mixed> $extra
+ * @return array{success:bool,message:string,external_id?:string,published_at?:string}
+ */
+function ok(string $message, array $extra = []): array
 {
-    return ['success' => true, 'message' => $message];
+    return ['success' => true, 'message' => $message] + $extra;
 }
 
 function devto_tags(string $hashtags): array
@@ -195,7 +198,15 @@ function handle_facebook(array $config, array $content): array
     if (isset($data['error'])) {
         fail(($data['error']['message'] ?? null) ?: 'Unknown Graph error');
     }
-    return ok('Published to Facebook — Post ' . ($data['id'] ?? '?'));
+    $postId = (string) ($data['id'] ?? '');
+    // Record the real Graph post id and timestamp so a published post can be
+    // proven later instead of inferred from the status flag alone.
+    $extra = [];
+    if ($postId !== '') {
+        $extra['external_id'] = $postId;
+        $extra['published_at'] = gmdate('c');
+    }
+    return ok('Published to Facebook — Post ' . ($postId ?: '?'), $extra);
 }
 
 function handle_linkedin(array $config, array $content): array

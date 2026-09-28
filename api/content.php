@@ -43,6 +43,9 @@ function item_shape(array $r): array
     if ($r['scheduled_at'] !== null) {
         $out['scheduledISO'] = str_replace(' ', 'T', (string) $r['scheduled_at']);
     }
+    // Publish provenance: present only when the post actually reached the platform.
+    if (!empty($r['external_id'])) $out['externalPostId'] = $r['external_id'];
+    if (!empty($r['published_at'])) $out['publishedAt'] = str_replace(' ', 'T', (string) $r['published_at']);
     return $out;
 }
 
@@ -182,6 +185,12 @@ try {
             'video_url' => $in['generatedVideoUrl'] ?? $existing['video_url'],
             'approval_state' => array_key_exists('approvalStage', $in) || array_key_exists('approvalLog', $in)
                 ? (approval_state_json($in) ?? null) : $existing['approval_state'],
+            'external_id' => array_key_exists('externalPostId', $in)
+                ? ($in['externalPostId'] === '' || $in['externalPostId'] === null ? null : (string) $in['externalPostId'])
+                : $existing['external_id'],
+            'published_at' => array_key_exists('publishedAt', $in)
+                ? parse_dt($in['publishedAt'])
+                : $existing['published_at'],
         ];
         $sets = implode(', ', array_map(fn($c) => "`$c` = ?", array_keys($cols)));
         $params = array_values($cols);

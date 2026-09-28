@@ -34,6 +34,10 @@ export interface ContentItem {
   scheduledISO?: string;
   generatedImageUrl?: string;
   generatedVideoUrl?: string;
+  /** Platform post id returned by a confirmed publish (e.g. Facebook PAGEID_POSTID). */
+  externalPostId?: string;
+  /** ISO timestamp of a confirmed publish. Absent when never published. */
+  publishedAt?: string;
 }
 
 export interface AuthUser {
