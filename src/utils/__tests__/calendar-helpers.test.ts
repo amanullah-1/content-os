@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseScheduledDate, dateKey, addDays, getWeekStart, getDueScheduledPosts, isAutoPublishable, formatScheduledLabel, toDatetimeLocalValue } from "../calendar-helpers";
+import { parseScheduledDate, dateKey, addDays, getWeekStart, getDueScheduledPosts, isAutoPublishable, rescheduleRevivePatch, formatScheduledLabel, toDatetimeLocalValue } from "../calendar-helpers";
 import type { ContentItem } from "@/types";
 
 function makeItem(overrides: Partial<ContentItem> = {}): ContentItem {
@@ -267,6 +267,40 @@ describe("getDueScheduledPosts", () => {
     // Backwards compatibility: items approved before the stage counter existed
     // have no approvalStage. They must not publish unattended.
     expect(isAutoPublishable(makeItem({ status: "approved" }))).toBe(false);
+  });
+});
+
+describe("rescheduleRevivePatch", () => {
+  it("re-queues a published post so the new time can actually fire", () => {
+    // "published" is rejected by isAutoPublishable, so a rescheduled post left in
+    // that state could never publish again at its new time.
+    const published = makeItem({ status: "published", publishedAt: "2026-09-28T05:36:53Z", externalPostId: "PAGE_OLD" });
+    const patch = rescheduleRevivePatch(published);
+
+    expect(patch.status).toBe("scheduled");
+    expect(patch.publishedAt).toBeUndefined();
+    expect(patch.externalPostId).toBeUndefined();
+    // The revived post must be genuinely publishable again.
+    expect(isAutoPublishable({ ...published, ...patch })).toBe(true);
+  });
+
+  it("leaves non-published statuses untouched", () => {
+    for (const status of ["draft", "scheduled", "approved", "review"] as const) {
+      expect(rescheduleRevivePatch(makeItem({ status }))).toEqual({});
+    }
+  });
+
+  it("returns an empty patch for a missing item", () => {
+    expect(rescheduleRevivePatch(undefined)).toEqual({});
+  });
+
+  it("only revives published posts in a mixed batch", () => {
+    const batch = [
+      makeItem({ id: 1, status: "published", externalPostId: "PAGE_1" }),
+      makeItem({ id: 2, status: "scheduled" }),
+    ];
+    expect(Object.keys(rescheduleRevivePatch(batch[0])).length).toBeGreaterThan(0);
+    expect(rescheduleRevivePatch(batch[1])).toEqual({});
   });
 });
 

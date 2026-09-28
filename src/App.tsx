@@ -19,7 +19,7 @@ import {
   type ApprovalLogEntry,
 } from "./utils/approval";
 import { runAutoPublish } from "./utils/auto-publish";
-import { addDays, dateKey, formatScheduledLabel, getWeekStart, parseScheduledDate, toDatetimeLocalValue } from "./utils/calendar-helpers";
+import { addDays, dateKey, formatScheduledLabel, getWeekStart, parseScheduledDate, rescheduleRevivePatch, toDatetimeLocalValue } from "./utils/calendar-helpers";
 import { patchItem, patchItems } from "./utils/content-ops";
 import {
   buildQueue, canRetry, countByState, makeQueueEntry, publishStateLabel, resetEntries,
@@ -4415,7 +4415,7 @@ function canPublishItem(item: ContentItem, brands: Brand[]): boolean {
  * Never throws — a thrown error becomes a failed result so a bad channel can't
  * abort the rest of the queue run.
  */
-async function publishToConnectedPlatform(item: ContentItem, brands: Brand[]): Promise<{ success: boolean; message: string; externalId?: string; publishedAt?: string }> {
+async function publishToConnectedPlatform(item: ContentItem, brands: Brand[]): Promise<{ success: boolean; message: string; externalId?: string; publishedAt?: string; deduplicated?: boolean }> {
   const brand = brands.find(b => b.name === item.brand);
   const channel = getBrandChannel(brand, item.platform);
   const defn = channel && PUBLISHING_DEFS.find(d => d.id === channel.platformId);
@@ -4442,6 +4442,7 @@ async function publishToConnectedPlatform(item: ContentItem, brands: Brand[]): P
       message: res.message,
       externalId: res.external_id,
       publishedAt: res.published_at,
+      deduplicated: res.deduplicated,
     };
   }
 
@@ -6207,6 +6208,11 @@ export default function App() {
     };
   };
 
+  // Moving the time of an already-published post must re-queue it; see
+  // rescheduleRevivePatch for why the naive "just set the new time" strands it.
+  const reschedulePatchFor = (item: ContentItem | undefined): Partial<ContentItem> =>
+    rescheduleRevivePatch(item) as Partial<ContentItem>;
+
   const handleStatusChange = async (id: number, s: Status) => {
     let patch: { scheduled?: string; scheduledISO?: string } = {};
     const current = content.find(c => c.id === id);
@@ -6259,7 +6265,14 @@ export default function App() {
       const res = await publishToConnectedPlatform(item, brands);
       if (res.success) {
         await recordPublished(item, res.externalId, res.publishedAt);
-        showToast(res.message);
+        // The proxy suppresses a send that repeats a post it already published.
+        // That is a success for the record but NOT a new post on the platform,
+        // and saying "Published" here is what made an unsent edit look live.
+        if (res.deduplicated) {
+          showToast(`No new post sent — ${item.platform} already has this post (${res.message})`);
+        } else {
+          showToast(res.message);
+        }
       } else {
         showToast(`Publish failed: ${res.message}`);
       }
@@ -6350,16 +6363,29 @@ export default function App() {
 
   const handleRescheduleManyContent = async (ids: number[], scheduled: string, scheduledISO: string) => {
     const token = getToken();
+    // A post already on the platform must re-enter the queue when its time
+    // moves, otherwise the new slot is silently dead.
+    const revived = ids.filter(id => content.find(c => c.id === id)?.status === "published");
     setContent(cs => {
-      const next = cs.map(c => ids.includes(c.id) ? { ...c, scheduled, scheduledISO } : c);
+      const next = cs.map(c => ids.includes(c.id) ? { ...c, scheduled, scheduledISO, ...reschedulePatchFor(c) } : c);
       persistContent(next);
       return next;
     });
     const n = ids.length;
-    showToast(`${n} post${n === 1 ? "" : "s"} rescheduled`);
+    const revivedNote = revived.length
+      ? ` — ${revived.length} already published, re-queued for the new time`
+      : "";
+    showToast(`${n} post${n === 1 ? "" : "s"} rescheduled${revivedNote}`);
     if (token) {
       for (const id of ids) {
-        try { await apiUpdateContent(token, id, { scheduled, scheduledISO }); }
+        const patch: Record<string, unknown> = { scheduled, scheduledISO };
+        const cur = content.find(c => c.id === id);
+        if (cur?.status === "published") {
+          patch.status = "scheduled";
+          patch.publishedAt = null;
+          patch.externalPostId = null;
+        }
+        try { await apiUpdateContent(token, id, patch); }
         catch (e) { showToast(apiErr(e)); }
       }
     }
@@ -6394,6 +6420,9 @@ export default function App() {
     const inFlight = inFlightRef.current;
     const tick = async () => {
       if (cancelled || inFlight.size > 0) return;
+      // Set by publish() below and read by onPublished() for the same item, so a
+      // suppressed duplicate is reported as "skipped" rather than as a send.
+      let lastDeduplicated = false;
       try {
         await runAutoPublish(contentRef.current, new Date(), inFlight, {
           findChannel: (item) => {
@@ -6403,13 +6432,17 @@ export default function App() {
           findDef: (channel) => PUBLISHING_DEFS.find(d => d.id === channel.platformId) ?? null,
           publish: async item => {
             const res = await publishToConnectedPlatform(item, brandsRef.current);
+            lastDeduplicated = !!res.deduplicated;
             if (res.success) recordPublishedRef.current(item, res.externalId, res.publishedAt);
             return res;
           },
           onPublished: (item) => {
             handleStatusChange(item.id, "published");
-            showToast(`Auto-published to ${item.platform} ✓`);
-          },          onFailed: (item, _defn, message) => {
+            showToast(lastDeduplicated
+              ? `Skipped — ${item.platform} already has this post (nothing sent)`
+              : `Auto-published to ${item.platform} ✓`);
+          },
+          onFailed: (item, _defn, message) => {
             showToast(`Auto-publish failed: ${message}`);
             window.dispatchEvent(new CustomEvent("contentos:auto-publish-failed", { detail: { itemId: item.id, message } }));
           },

@@ -89,6 +89,30 @@ export function isAutoPublishable(item: ContentItem): boolean {
   return item.status === "approved" && isFullyApproved(item.approvalStage ?? 0);
 }
 
+export interface ReschedulePatch {
+  status: "scheduled";
+  publishedAt: undefined;
+  externalPostId: undefined;
+}
+
+/**
+ * Extra fields to apply when a post's scheduled time moves.
+ *
+ * A post that already went out carries status "published", which isAutoPublishable
+ * rejects - it only accepts "scheduled" or a fully-approved "approved". So moving
+ * the time of a published post left it permanently unpublishable: the new slot
+ * could never fire, and the row kept showing the *old* post's publishedAt and
+ * externalPostId as though that slot had already been satisfied.
+ *
+ * Moving the time means a new publish is intended, so return the post to
+ * "scheduled" and drop the previous publish's evidence. The old platform post
+ * still exists; we just stop asserting it covers the new slot.
+ */
+export function rescheduleRevivePatch(item: ContentItem | undefined): ReschedulePatch | Record<string, never> {
+  if (item?.status !== "published") return {};
+  return { status: "scheduled", publishedAt: undefined, externalPostId: undefined };
+}
+
 // Posts that are publishable, due at-or-before `now`, and sorted oldest-first.
 // `isChannelConnected` lets the caller plug in branding lookup; posts with no
 // connected channel are still returned (channelConnected=false) so the queue can

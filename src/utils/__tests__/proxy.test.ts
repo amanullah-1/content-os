@@ -90,4 +90,40 @@ describe("proxyPublish", () => {
     expect(result.success).toBe(false);
     expect(result.message).toContain("Network error");
   });
+
+  it("surfaces deduplicated so the UI can tell a skip from a real send", async () => {
+    // The proxy answers a repeated send with success plus the *original* post's
+    // id and timestamp. Without this flag the caller reports "Published" for a
+    // request that never reached the platform.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({
+        success: true,
+        message: "Already published - skipped a duplicate send.",
+        external_id: "PAGE_OLD",
+        published_at: "2026-09-28T05:36:53+00:00",
+        deduplicated: true,
+      }),
+    }));
+
+    const result = await proxyPublish(payload);
+    expect(result.deduplicated).toBe(true);
+    expect(result.success).toBe(true);
+    expect(result.external_id).toBe("PAGE_OLD");
+  });
+
+  it("leaves deduplicated undefined for a genuine publish", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({
+        success: true,
+        message: "Published to Facebook - Post 123",
+        external_id: "123",
+        published_at: "2026-09-28T06:00:00+00:00",
+      }),
+    }));
+
+    const result = await proxyPublish(payload);
+    expect(result.deduplicated).toBeUndefined();
+  });
 });
