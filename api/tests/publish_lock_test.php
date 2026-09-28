@@ -44,13 +44,22 @@ contentos_publish_lock_release($k1);
 check('release frees the lock', contentos_publish_lock_acquire($k1) === null);
 contentos_publish_lock_release($k1);
 
-// An expired lock must not block forever.
+// An expired lock must not block forever: a crashed publish would otherwise
+// wedge the post until the hourly sweep removed the file.
 $path = contentos_publish_lock_path($k1);
 file_put_contents($path, json_encode([
     'state' => 'publishing', 'external_id' => null, 'at' => time() - 999, 'expires' => time() - 999,
 ]));
 $expired = contentos_publish_lock_acquire($k1, 120);
-check('an expired in-flight lock is still honoured as held', is_array($expired));
+check('an expired in-flight lock is reclaimable', $expired === null, 'expected reclaim, got ' . json_encode($expired));
+contentos_publish_lock_release($k1);
+
+// A live in-flight lock still blocks, so a slow publish is not interrupted.
+file_put_contents($path, json_encode([
+    'state' => 'publishing', 'external_id' => null, 'at' => time(), 'expires' => time() + 120,
+]));
+$live = contentos_publish_lock_acquire($k1, 120);
+check('a live in-flight lock is still honoured as held', is_array($live));
 contentos_publish_lock_release($k1);
 
 // Empty / unsafe keys disable locking rather than collapsing every post together.

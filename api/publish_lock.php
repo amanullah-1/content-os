@@ -46,6 +46,20 @@ function contentos_publish_lock_read(string $key): ?array
 }
 
 /**
+ * Is this record still within the window it was written for?
+ *
+ * Records carry an "expires" stamp. It has to be consulted here: the sweep only
+ * clears files older than an hour, so without this check a lock outlives its own
+ * window by up to 45 minutes.
+ */
+function contentos_publish_lock_is_live(array $record): bool
+{
+    $expires = (int) ($record['expires'] ?? 0);
+    if ($expires <= 0) return true; // no stamp: treat as live rather than steal it
+    return $expires > time();
+}
+
+/**
  * Try to take the lock.
  *
  * @return array|null null when the lock was acquired, otherwise the existing
@@ -61,6 +75,15 @@ function contentos_publish_lock_acquire(string $key, int $ttl = CONTENTOS_LOCK_T
         $existing = contentos_publish_lock_read($key);
         if ($existing === null) {
             // File vanished between the two calls - retry once.
+            $handle = @fopen($path, 'x');
+            if ($handle === false) return contentos_publish_lock_read($key);
+        } elseif (!contentos_publish_lock_is_live($existing)) {
+            // The holder's window has closed. The old code returned this record
+            // anyway and reported a *successful* publish using the previous
+            // post's id and timestamp, so editing a post and re-publishing it
+            // silently did nothing: the caller saw success, the platform never
+            // received the new content. Take the lock over instead.
+            @unlink($path);
             $handle = @fopen($path, 'x');
             if ($handle === false) return contentos_publish_lock_read($key);
         } else {
