@@ -37,10 +37,49 @@ describe("parseScheduledDate", () => {
   });
 
   it("parses scheduled string with em dash", () => {
-    const item = makeItem({ scheduled: "Sep 15, 2026 — 7:30 PM" });
+    const item = makeItem({ scheduled: "Sep 15, 2026 - 7:30 PM" });
     const result = parseScheduledDate(item);
     expect(result).toBeInstanceOf(Date);
   });
+
+  it("assumes the current year when the label has no year", () => {
+    // Without this, "Sep 28 12:51 PM" parses as 2001-09-28 and the post looks
+    // decades overdue.
+    const item = makeItem({ scheduled: "Sep 28 12:51 PM" });
+    const result = parseScheduledDate(item);
+    expect(result).toBeInstanceOf(Date);
+    expect(result!.getFullYear()).toBe(new Date().getFullYear());
+    expect(result!.getMonth()).toBe(8); // September
+    expect(result!.getDate()).toBe(28);
+  });
+
+  it("still honours an explicit year in the label", () => {
+    const item = makeItem({ scheduled: "Sep 15, 2026 - 7:30 PM" });
+    expect(parseScheduledDate(item)!.getFullYear()).toBe(2026);
+  });
+
+  it("prefers scheduledISO over the label", () => {
+    const item = makeItem({ scheduledISO: "2026-09-15T10:30:00Z", scheduled: "Dec 1 9:00 AM" });
+    expect(parseScheduledDate(item)!.getFullYear()).toBe(2026);
+  });
+
+  it("returns null for a day that does not exist instead of rolling over", () => {
+    expect(parseScheduledDate(makeItem({ scheduled: "Feb 31, 2026 9:00 AM" }))).toBeNull();
+  });
+
+  it("honours 12-hour clock edge cases", () => {
+    const midnight = parseScheduledDate(makeItem({ scheduled: "Sep 15, 2026 12:00 AM" }))!;
+    expect(midnight.getHours()).toBe(0);
+    const noon = parseScheduledDate(makeItem({ scheduled: "Sep 15, 2026 12:00 PM" }))!;
+    expect(noon.getHours()).toBe(12);
+    const evening = parseScheduledDate(makeItem({ scheduled: "Sep 15, 2026 7:30 PM" }))!;
+    expect(evening.getHours()).toBe(19);
+  });
+
+  it("accepts a hyphen separator without an em dash", () => {
+    expect(parseScheduledDate(makeItem({ scheduled: "Sep 15, 2026 - 7:30 PM" }))).toBeInstanceOf(Date);
+  });
+
 
   it("parses scheduled string without em dash", () => {
     const item = makeItem({ scheduled: "Sep 15, 2026 7:30 PM" });

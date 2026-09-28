@@ -1,14 +1,40 @@
 import type { ContentItem } from "@/types";
 
+const MONTHS: Record<string, number> = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+// Accepts "Sep 15, 2026 - 7:30 PM", "Sep 15, 2026 7:30 PM", "Sep 28 12:51 PM",
+// "Sep 15 2026". The year is optional and defaults to the current year: without
+// it the engine assumes 2001, which makes a post look decades overdue.
+const SCHED_RE = /^([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:\s*,?\s*(\d{4}))?(?:\s+(\d{1,2}):(\d{2})\s*([AaPp][Mm])?)?/;
+
 export function parseScheduledDate(item: ContentItem): Date | null {
   if (item.scheduledISO) {
     const d = new Date(item.scheduledISO);
     return isNaN(d.getTime()) ? null : d;
   }
   if (!item.scheduled) return null;
-  const s = item.scheduled.replace(/—/, "").replace(/\s+/g, " ").trim();
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d;
+  // Normalise em/en dashes used as separators; a bare hyphen is part of the
+  // time range, so treat it as whitespace too.
+  const s = item.scheduled.replace(/[\u2014\u2013-]/g, " ").replace(/\s+/g, " ").trim();
+  const m = SCHED_RE.exec(s);
+  if (!m) return null;
+  const month = MONTHS[m[1].slice(0, 3).toLowerCase()];
+  if (month === undefined) return null;
+  const day = Number(m[2]);
+  const year = m[3] ? Number(m[3]) : new Date().getFullYear();
+  let hours = 0;
+  let minutes = 0;
+  if (m[4] !== undefined) {
+    hours = Number(m[4]);
+    minutes = Number(m[5]);
+    const meridiem = m[6]?.toLowerCase();
+    if (meridiem === "pm" && hours < 12) hours += 12;
+    else if (meridiem === "am" && hours === 12) hours = 0;
+  }
+  const d = new Date(year, month, day, hours, minutes, 0, 0);
+  // Reject rollovers such as "Feb 31" instead of silently sliding into March.
+  if (isNaN(d.getTime()) || d.getFullYear() !== year || d.getMonth() !== month || d.getDate() !== day) return null;
+  return d;
 }
 
 export function dateKey(d: Date): string {
