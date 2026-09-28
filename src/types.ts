@@ -72,7 +72,7 @@ export interface Integration {
   config: IntegrationConfig;
 }
 
-export type ScheduleProviderId = "claude" | "groq" | "pollinations" | "huggingface";
+export type ScheduleProviderId = "claude" | "groq" | "pollinations" | "huggingface" | "gemini";
 
 export interface ProviderCreds {
   claudeKey: string;

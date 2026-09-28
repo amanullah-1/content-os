@@ -1287,6 +1287,30 @@ async function callHuggingFaceText(apiToken: string, model: string, prompt: stri
   return generated;
 }
 
+async function callGeminiText(apiKey: string, model: string, prompt: string, system?: string): Promise<string> {
+  const res = await fetch(`${GEMINI_API_BASE}/models/${encodeURIComponent(model)}:generateContent`, {
+    method: "POST",
+    headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
+      generationConfig: { temperature: 0.7, maxOutputTokens: 8000 },
+    }),
+  });
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({})) as { error?: { message?: string } };
+    throw new Error(e.error?.message || `Gemini HTTP ${res.status}`);
+  }
+  const data = await res.json() as {
+    candidates?: { content?: { parts?: { text?: string }[] } }[];
+  };
+  // Concatenate every text part rather than taking parts[0]: a thinking model
+  // can split its reply across parts, and the JSON we asked for is the last one.
+  const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("").trim();
+  if (!text) throw new Error("No content in Gemini response");
+  return text;
+}
+
 // Provider + model catalogue for schedule generation
 const SCHEDULE_PROVIDERS = [
   {
@@ -1348,6 +1372,21 @@ const SCHEDULE_PROVIDERS = [
       { id: "openai/gpt-oss-120b",         label: "GPT-OSS 120B",  desc: "Open weights, slow" },
     ],
   },
+  {
+    id: "gemini",
+    name: "Google Gemini",
+    icon: "✨",
+    color: "#4285f4",
+    desc: "Google AI Studio — same key also unlocks Nano Banana image generation",
+    requiresKey: true,
+    // Stable (GA) text models only, no -preview ids, so a client demo never
+    // rides on a model that can be pulled. 3.8 Flash went GA 2026-09-02.
+    models: [
+      { id: "gemini-3.8-flash",       label: "3.8 Flash",      desc: "Newest, most capable" },
+      { id: "gemini-3.5-flash",       label: "3.5 Flash",      desc: "Fast & capable" },
+      { id: "gemini-3.5-flash-lite",  label: "3.5 Flash Lite", desc: "Cheapest & fastest" },
+    ],
+  },
 ] as const;
 
 type ScheduleProviderId = typeof SCHEDULE_PROVIDERS[number]["id"];
@@ -1364,15 +1403,16 @@ Platform: ${form.platform || "Social media"}
 Format: ${form.format || "Post"}`;
 }
 
-interface ProviderCreds { claudeKey: string; groqKey: string; pollinationsKey: string; hfToken: string; }
+  interface ProviderCreds { claudeKey: string; groqKey: string; pollinationsKey: string; hfToken: string; geminiKey: string; }
 
-async function callAnyProvider(provider: ScheduleProviderId, model: string, creds: ProviderCreds, userPrompt: string, system?: string): Promise<string> {
-  const sys = system || "You are a JSON API. Return only valid JSON, no markdown, no explanation.";
-  if (provider === "claude")       return callClaude(creds.claudeKey, model, userPrompt, 1400, sys, true);
-  if (provider === "groq")         return callGroqText(creds.groqKey, model, userPrompt, sys);
-  if (provider === "pollinations") return callPollinationsText(creds.pollinationsKey, model, userPrompt, sys);
-  return callHuggingFaceText(creds.hfToken, model, userPrompt, sys);
-}
+  async function callAnyProvider(provider: ScheduleProviderId, model: string, creds: ProviderCreds, userPrompt: string, system?: string): Promise<string> {
+    const sys = system || "You are a JSON API. Return only valid JSON, no markdown, no explanation.";
+    if (provider === "claude")       return callClaude(creds.claudeKey, model, userPrompt, 1400, sys, true);
+    if (provider === "groq")         return callGroqText(creds.groqKey, model, userPrompt, sys);
+    if (provider === "pollinations") return callPollinationsText(creds.pollinationsKey, model, userPrompt, sys);
+    if (provider === "gemini")       return callGeminiText(creds.geminiKey, model, userPrompt, sys);
+    return callHuggingFaceText(creds.hfToken, model, userPrompt, sys);
+  }
 
 function extractJSON(text: string): GeneratedContent {
   const stripped = text.replace(/```(?:json)?\s*/gi, "").replace(/```\s*/g, "").trim();
@@ -1669,6 +1709,7 @@ function ContentFormPanel({ item, brands, open, onClose, onSave, apiKey, aiModel
     if (pid === "groq")         return !!(groqInt?.connected && groqInt.config.apiKey);
     if (pid === "pollinations") return !!(pollinations?.connected && pollinations.config.apiKey);
     if (pid === "huggingface")  return !!(huggingface?.connected && huggingface.config.apiToken);
+    if (pid === "gemini")       return !!(gemini?.connected && gemini.config.apiKey);
     return false;
   };
 
@@ -1715,11 +1756,12 @@ function ContentFormPanel({ item, brands, open, onClose, onSave, apiKey, aiModel
     groqKey:          groqInt?.config.apiKey || "",
     pollinationsKey:  pollinations?.config.apiKey || "",
     hfToken:          huggingface?.config.apiToken || "",
+    geminiKey:        gemini?.config.apiKey || "",
   });
 
   const handleGenerate = async () => {
     if (!contentProviderAvailable(contentProvider)) {
-      const names: Record<ScheduleProviderId, string> = { claude: "Anthropic API key", groq: "Groq", pollinations: "Pollinations.ai", huggingface: "Hugging Face" };
+        const names: Record<ScheduleProviderId, string> = { claude: "Anthropic API key", groq: "Groq", pollinations: "Pollinations.ai", huggingface: "Hugging Face", gemini: "Google Gemini" };
       setAiError(`${names[contentProvider]} not connected — add it in Integrations → AI & Automation.`);
       return;
     }
@@ -1828,13 +1870,13 @@ function ContentFormPanel({ item, brands, open, onClose, onSave, apiKey, aiModel
         <div className="rounded-xl border overflow-hidden" style={{ borderColor: t.border, background: t.sectionBg }}>
           <div className="px-3 pt-3 pb-2">
             <div className="text-xs font-bold mb-2" style={{ color: t.textSub }}>AI Provider</div>
-            <div className="grid grid-cols-4 gap-1.5">
+            <div className="flex flex-wrap gap-1.5">
               {SCHEDULE_PROVIDERS.map(prov => {
                 const active = contentProvider === prov.id;
                 const avail = contentProviderAvailable(prov.id);
                 return (
                   <button key={prov.id} type="button" onClick={() => setContentProvider(prov.id)}
-                    className="flex flex-col items-center gap-1 py-2 px-1 rounded-lg text-center transition-all border"
+                    className="flex-1 min-w-[70px] flex flex-col items-center gap-1 py-2 px-1 rounded-lg text-center transition-all border"
                     style={{ background: active ? prov.color + "22" : t.inputBg, borderColor: active ? prov.color : t.border, opacity: avail ? 1 : 0.55 }}>
                     <span className="text-base leading-none">{prov.icon}</span>
                     <span className="text-xs font-semibold leading-tight" style={{ color: active ? prov.color : t.textMuted }}>{prov.name.split(".")[0]}</span>
@@ -3758,7 +3800,7 @@ const INTEGRATION_DEFS: {
   {
     id: "gemini", name: "Google Gemini", icon: "✨", color: "#4285f4", bg: "#e8f0fe",
     category: "AI & Automation",
-    desc: "Nano Banana image generation — strong prompt understanding and legible text inside images",
+    desc: "One key for both jobs — Gemini 3.8/3.5 Flash for captions, and Nano Banana for images",
     fields: [
       { key: "apiKey",    label: "API Key",               placeholder: "AIzaSy…", secret: true, hint: "From aistudio.google.com/apikey" },
       { key: "model",     label: "Model (optional)",      placeholder: "gemini-3.1-flash-image", hint: "Leave blank for Nano Banana 2", optional: true },
@@ -3771,8 +3813,8 @@ const INTEGRATION_DEFS: {
         { step: "Click 'Create API key'", detail: "Sign in with the Google account that owns the project, then pick or create a project." },
         { step: "Copy the key — it starts with AIza", detail: "It is only shown once. Paste it into the API Key field above." },
         { step: "A Gemini subscription is not API access", detail: "Google One AI Premium unlocks Gemini in Google's consumer apps, but the API needs its own key from AI Studio. The free tier is enough to try it." },
-        { step: "Which model", detail: "Default is Nano Banana 2 (gemini-3.1-flash-image): fast and versatile. Nano Banana Pro (gemini-3-pro-image) is higher quality but slower." },
-        { step: "Billing note", detail: "Image generation is metered per image. Set a budget alert in AI Studio before a demo so a runaway prompt cannot surprise you." },
+        { step: "Which model", detail: "Leave Model blank and it defaults to Nano Banana 2 (gemini-3.1-flash-image) for images: fast and versatile. Nano Banana Pro (gemini-3-pro-image) is higher quality but slower. This field only affects images — captions and scripts use the Gemini Flash models you pick in the post composer." },
+        { step: "Billing note", detail: "Image generation is metered per image, and text is metered per token. Set a budget alert in AI Studio before a demo so a runaway prompt cannot surprise you." },
       ],
     },
   },
@@ -4709,11 +4751,13 @@ function GenerateSchedulePanel({ open, onClose, brands, apiKey, aiModel, integra
   const hfIntegration        = integrations.find(i => i.id === "huggingface");
   const groqIntegration      = integrations.find(i => i.id === "groq");
   const pollinationsSchedule = integrations.find(i => i.id === "pollinations");
+  const geminiIntegration    = integrations.find(i => i.id === "gemini");
   const providerAvailable = (pid: ScheduleProviderId) => {
     if (pid === "claude")       return !!apiKey;
     if (pid === "groq")         return !!groqIntegration?.connected && !!groqIntegration?.config.apiKey;
     if (pid === "pollinations") return !!pollinationsSchedule?.connected && !!pollinationsSchedule?.config.apiKey;
     if (pid === "huggingface")  return !!hfIntegration?.connected && !!hfIntegration?.config.apiToken;
+    if (pid === "gemini")       return !!geminiIntegration?.connected && !!geminiIntegration?.config.apiKey;
     return false;
   };
 
@@ -4747,6 +4791,7 @@ function GenerateSchedulePanel({ open, onClose, brands, apiKey, aiModel, integra
     if (scheduleProvider === "groq"         && !groqIntegration?.config.apiKey)       { setError("Connect Groq in Integrations → AI & Automation first."); return; }
     if (scheduleProvider === "pollinations" && !pollinationsSchedule?.config.apiKey)  { setError("Connect Pollinations.ai in Integrations → AI & Automation first."); return; }
     if (scheduleProvider === "huggingface"  && !hfIntegration?.config.apiToken)       { setError("Connect Hugging Face in Integrations → AI & Automation first."); return; }
+    if (scheduleProvider === "gemini"       && !geminiIntegration?.config.apiKey)     { setError("Connect Google Gemini in Integrations → AI & Automation first."); return; }
     if (!brand || platforms.length === 0) { setError("Select a brand and at least one platform."); return; }
     setLoading(true); setError(null);
     const b = selectedBrand!;
@@ -4931,6 +4976,7 @@ Return ONLY a valid JSON array, no markdown:
           {scheduleProvider === "groq"         && !groqIntegration?.config.apiKey       && <div className="text-xs px-3 py-2 rounded-lg" style={{ background: t.dangerBg, color: t.danger }}>Groq not connected — add your free key in Integrations → AI & Automation.</div>}
           {scheduleProvider === "pollinations" && !pollinationsSchedule?.config.apiKey  && <div className="text-xs px-3 py-2 rounded-lg" style={{ background: t.dangerBg, color: t.danger }}>Pollinations.ai not connected — add your API key in Integrations → AI & Automation.</div>}
           {scheduleProvider === "huggingface"  && !hfIntegration?.config.apiToken       && <div className="text-xs px-3 py-2 rounded-lg" style={{ background: t.dangerBg, color: t.danger }}>Hugging Face not connected — configure it in Integrations → AI & Automation.</div>}
+          {scheduleProvider === "gemini"       && !geminiIntegration?.config.apiKey     && <div className="text-xs px-3 py-2 rounded-lg" style={{ background: t.dangerBg, color: t.danger }}>Google Gemini not connected — add your AI Studio key in Integrations → AI & Automation.</div>}
           <div className="flex gap-3 pt-1">
             <button type="button" onClick={onClose} className="flex-1 py-2.5 rounded-xl text-sm font-semibold border" style={{ borderColor: t.border, color: t.textSub, background: t.card }}>Cancel</button>
             <button type="button" onClick={handleGenerate} disabled={loading || !brand || !platforms.length || !providerAvailable(scheduleProvider)}
