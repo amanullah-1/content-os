@@ -4428,6 +4428,7 @@ async function publishToConnectedPlatform(item: ContentItem, brands: Brand[]): P
     const res = await proxyPublish({
       platform: defn.id,
       config: c,
+      contentId: item.id,
       content: {
         caption: item.caption,
         hashtags: item.hashtags,

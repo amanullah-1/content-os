@@ -10,6 +10,13 @@
 //     -> 200 { success: false, message: "..." }  for unsupported platforms
 //     -> 500 { success: false, message: "..." }  on upstream / transport errors
 //   GET -> 200 { ok: true, platforms: [...] } (health check)
+//
+// Optional request field `contentId` (the app's content item id) enables
+// duplicate suppression via publish_lock.php: a second concurrent or repeat
+// request for the same post returns success with the original post id instead
+// of sending a second copy. Omit it and behaviour is unchanged.
+
+require_once __DIR__ . '/publish_lock.php';
 
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
@@ -356,6 +363,49 @@ $content = is_array($req['content'] ?? null) ? $req['content'] : [];
 $content['caption'] = (string) ($content['caption'] ?? '');
 $content['hashtags'] = (string) ($content['hashtags'] ?? '');
 
+// Dedupe key: the content item id when the client sends one. Without it there is
+// no safe way to tell a duplicate from two genuinely identical posts, so locking
+// is skipped rather than guessed at.
+$contentId = $req['contentId'] ?? ($content['id'] ?? null);
+$lockKey = ($contentId === null || $contentId === '' || !is_scalar($contentId))
+    ? ''
+    : $platform . ':' . (int) $contentId;
+
+$held = null;
+if ($lockKey !== '') {
+    contentos_publish_lock_sweep();
+    $held = contentos_publish_lock_acquire($lockKey);
+    if ($held !== null) {
+        // Another request already published this post (or is mid-flight).
+        // Report success with the original post id so this caller converges on
+        // the same state instead of posting a second copy.
+        $externalId = $held['external_id'] ?? null;
+        http_response_code(200);
+        echo json_encode([
+            'success' => true,
+            'message' => ($held['state'] ?? '') === 'published'
+                ? 'Already published — skipped a duplicate send.'
+                : 'This post is already being published — skipped a duplicate send.',
+            'external_id' => $externalId ?: null,
+            'published_at' => ($held['state'] ?? '') === 'published'
+                ? gmdate('c', (int) ($held['at'] ?? time()))
+                : null,
+            'deduplicated' => true,
+        ]);
+        exit;
+    }
+    // Handlers call fail(), which exits. Without this the lock would sit as
+    // "publishing" for the full TTL and block every retry after an error.
+    $GLOBALS['contentos_lock_key'] = $lockKey;
+    $GLOBALS['contentos_lock_kept'] = false;
+    register_shutdown_function(static function (): void {
+        $key = $GLOBALS['contentos_lock_key'] ?? '';
+        if ($key !== '' && empty($GLOBALS['contentos_lock_kept'])) {
+            contentos_publish_lock_release($key);
+        }
+    });
+}
+
 switch ($platform) {
     case 'devto':       $result = handle_devto($config, $content); break;
     case 'woocommerce': $result = handle_woocommerce($config, $content); break;
@@ -365,12 +415,24 @@ switch ($platform) {
     case 'tiktok':      $result = handle_tiktok($config, $content); break;
     case 'x':           $result = handle_x($config, $content); break;
     default:
+        if ($lockKey !== '') contentos_publish_lock_release($lockKey);
         http_response_code(200);
         echo json_encode([
             'success' => false,
             'message' => "Platform \"$platform\" is not supported for direct publishing. Use the platform's native app.",
         ]);
         exit;
+}
+
+// Only a confirmed publish is remembered; failures release the lock so a retry
+// (or the next 45s tick) can still go out.
+if ($lockKey !== '') {
+    if (!empty($result['success'])) {
+        contentos_publish_lock_commit($lockKey, $result['external_id'] ?? null);
+        $GLOBALS['contentos_lock_kept'] = true;
+    } else {
+        contentos_publish_lock_release($lockKey);
+    }
 }
 
 echo json_encode($result);

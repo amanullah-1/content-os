@@ -8,6 +8,12 @@ const PROXY_BASE =
 interface ProxyPayload {
   platform: string;
   config: Record<string, string>;
+  /**
+   * The app's content item id. Sent so the proxy can suppress duplicate sends:
+   * the auto-publish loop runs in every open tab and would otherwise publish the
+   * same due post once per tab.
+   */
+  contentId?: number;
   content: {
     caption: string;
     hashtags: string;
@@ -23,6 +29,8 @@ interface ProxyResult {
   external_id?: string;
   /** ISO timestamp set by the proxy at the moment of a confirmed publish. */
   published_at?: string;
+  /** True when the proxy suppressed a duplicate request for an already-published post. */
+  deduplicated?: boolean;
 }
 
 export async function proxyPublish(payload: ProxyPayload): Promise<ProxyResult> {
