@@ -20,6 +20,7 @@ import {
 } from "./utils/approval";
 import { runAutoPublish } from "./utils/auto-publish";
 import { addDays, dateKey, formatScheduledLabel, getWeekStart, parseScheduledDate, toDatetimeLocalValue } from "./utils/calendar-helpers";
+import { patchItem, patchItems } from "./utils/content-ops";
 import {
   buildQueue, canRetry, countByState, makeQueueEntry, publishStateLabel, resetEntries,
   retryableIds, runPublishQueue, summarizeReport,
@@ -5810,6 +5811,12 @@ function loadLocalContent(): ContentItem[] {
   catch { return SEED_CONTENT; }
 }
 
+// Module-level, not a ref: StrictMode double-invokes effects, and the mount
+// effect that calls this runs twice in dev. Without a guard the second run found
+// brands still empty (the first had not finished creating them) and pushed every
+// local item a second time, leaving duplicate content rows in the database.
+let localPushStarted = false;
+
 async function pushLocalToApi(token: string): Promise<{ brands: Brand[]; content: ContentItem[] }> {
   for (const b of loadLocalBrands()) {
     const { id: _bid, ideas: _i, drafts: _d, review: _r, scheduled: _s, posts_month: _p, ...payload } = b;
@@ -5975,8 +5982,9 @@ export default function App() {
           const bs = data as unknown as Brand[];
           setBrands(bs);
           localStorage.setItem("contentOS_brands", JSON.stringify(bs));
-        } else {
+        } else if (!localPushStarted) {
           // First run after migration: push local cache/seeds, then re-read.
+          localPushStarted = true;
           try {
             const pushed = await pushLocalToApi(token);
             if (pushed.brands.length > 0) {
@@ -6185,19 +6193,25 @@ export default function App() {
       catch (e) { showToast(apiErr(e)); }
     }
   };
+  // Moving a post to "scheduled" without giving it a date strands it: the
+  // publish queue and auto-publish both go through parseScheduledDate, which
+  // returns null with no date, so the post is silently unreachable. Stamp
+  // "now" so it becomes immediately due and publishable. Shared by the single
+  // and bulk status paths - when only one of them had it, bulk-scheduling a
+  // dateless post produced a permanently stuck row.
+  const scheduleStampFor = (): { scheduled: string; scheduledISO: string } => {
+    const now = new Date();
+    return {
+      scheduledISO: now.toISOString(),
+      scheduled: formatScheduledLabel(now),
+    };
+  };
+
   const handleStatusChange = async (id: number, s: Status) => {
-    // Moving a post to "scheduled" without giving it a date strands it: the
-    // publish queue and auto-publish both go through parseScheduledDate, which
-    // returns null with no date, so the post is silently unreachable. Stamp
-    // "now" so it becomes immediately due and publishable.
     let patch: { scheduled?: string; scheduledISO?: string } = {};
     const current = content.find(c => c.id === id);
     if (s === "scheduled" && current && parseScheduledDate(current) === null) {
-      const now = new Date();
-      patch = {
-        scheduledISO: now.toISOString(),
-        scheduled: now.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }),
-      };
+      patch = scheduleStampFor();
     }
     setContent(cs => {
       const next = cs.map(c => c.id === id ? { ...c, status: s, ...patch } : c);
@@ -6277,8 +6291,16 @@ export default function App() {
       const r = addComment(st, by, note ?? "");
       next = { ...item, approvalStage: r.stage, approvalLog: r.log };
     }
-    persistContent(content.map(c => c.id === id ? next : c));
-    setContent(cs => cs.map(c => c.id === id ? next : c));
+    setContent(cs => {
+      // Derive the next array from the current state, not the render-time
+      // `content` this closure captured. bulkApprove/bulk reject fire N of
+      // these synchronously in one tick, so they all shared one stale snapshot:
+      // each persisted an array with only its own item changed, and the last
+      // write won. Approvals silently vanished on reload.
+      const updated = patchItem(cs, id, next);
+      persistContent(updated);
+      return updated;
+    });
     if (toastMsg) showToast(toastMsg);
     const token = getToken();
     if (token) {
@@ -6302,8 +6324,17 @@ export default function App() {
 
   const handleStatusManyContent = async (ids: number[], s: Status) => {
     const token = getToken();
+    const stamped: { scheduled: string; scheduledISO: string } | null =
+      s === "scheduled" ? scheduleStampFor() : null;
     setContent(cs => {
-      const next = cs.map(c => ids.includes(c.id) ? { ...c, status: s } : c);
+      const next = patchItems(cs, new Map(ids.map(id => {
+        const current = cs.find(c => c.id === id);
+        // Same anti-stranding guard as the single path: a dateless post set to
+        // "scheduled" has no parseable date, so both the queue and auto-publish
+        // skip it forever.
+        const needsStamp = s === "scheduled" && current !== undefined && parseScheduledDate(current) === null;
+        return [id, { status: s, ...(needsStamp && stamped ? stamped : null) }] as const;
+      })));
       persistContent(next);
       return next;
     });
@@ -6337,7 +6368,12 @@ export default function App() {
   // ── Auto-publish loop ──
   // Ticks once on mount, then every 45s. Publishes any post due at-or-before
   // now for brands with a connected publishing channel.
-  const [autoPublish, setAutoPublish] = useState<boolean>(() => localStorage.getItem("contentOS_autoPublish") !== "off");
+    const [autoPublish, setAutoPublish] = useState<boolean>(() => localStorage.getItem("contentOS_autoPublish") !== "off");
+    // Must outlive the effect below. As a plain local it was rebuilt every time
+    // the effect re-ran (i.e. on every Auto-publish ON/OFF toggle), so flipping
+    // the switch mid-publish emptied the set while a publish was still awaiting
+    // and let the next tick send the same post again.
+    const inFlightRef = useRef<Set<number>>(new Set());
   const contentRef = useRef<ContentItem[]>(content);
   const brandsRef = useRef<Brand[]>(brands);
   const recordPublishedRef = useRef(recordPublished);
@@ -6355,7 +6391,7 @@ export default function App() {
   useEffect(() => {
     if (!autoPublish) return;
     let cancelled = false;
-    const inFlight = new Set<number>();
+    const inFlight = inFlightRef.current;
     const tick = async () => {
       if (cancelled || inFlight.size > 0) return;
       try {
