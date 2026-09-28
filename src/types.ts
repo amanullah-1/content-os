@@ -62,7 +62,7 @@ export interface AuthCtxValue {
 
 export interface StoredUser extends AuthUser { pwHash: string }
 
-export type IntegrationId = "falai" | "replicate" | "pollinations" | "huggingface" | "stablehorde" | "groq";
+export type IntegrationId = "falai" | "replicate" | "pollinations" | "huggingface" | "stablehorde" | "groq" | "gemini";
 
 export interface IntegrationConfig { [key: string]: string }
 

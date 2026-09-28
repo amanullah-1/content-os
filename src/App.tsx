@@ -22,6 +22,10 @@ import { runAutoPublish } from "./utils/auto-publish";
 import { addDays, dateKey, formatScheduledLabel, getWeekStart, parseScheduledDate, rescheduleRevivePatch, toDatetimeLocalValue } from "./utils/calendar-helpers";
 import { patchItem, patchItems } from "./utils/content-ops";
 import {
+  GEMINI_API_BASE, explainGeminiFailure, extractGeminiImage,
+  geminiAspectRatio, resolveGeminiModel, resolveGeminiSize,
+} from "./utils/gemini-image";
+import {
   buildQueue, canRetry, countByState, makeQueueEntry, publishStateLabel, resetEntries,
   retryableIds, runPublishQueue, summarizeReport,
   MAX_PUBLISH_ATTEMPTS,
@@ -1507,6 +1511,58 @@ async function generateImageStableHorde(apiKey: string, prompt: string, model?: 
   throw new Error("Stable Horde timed out (3 min)");
 }
 
+// Google Gemini ("Nano Banana"). Returns an object URL built from the base64
+// payload, matching the blob-URL contract the other providers use.
+async function generateImageGemini(apiKey: string, prompt: string, modelId?: string, imageSize?: string, format?: string, onProgress?: (msg: string) => void): Promise<string> {
+  const key = apiKey?.trim();
+  if (!key) throw new Error("Gemini API key missing — add it in Integrations → AI & Automation.");
+  const model = resolveGeminiModel(modelId);
+  const size = resolveGeminiSize(model, imageSize);
+  const aspectRatio = geminiAspectRatio(format || "Image");
+  onProgress?.(`Gemini (${model.label}) is rendering…`);
+
+  let res: Response;
+  try {
+    res = await fetch(`${GEMINI_API_BASE}/${model.id}:generateContent`, {
+      method: "POST",
+      headers: { "x-goog-api-key": key, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseModalities: ["TEXT", "IMAGE"],
+          imageConfig: { aspectRatio, imageSize: size },
+        },
+      }),
+    });
+  } catch {
+    // Network/CORS failure. generativelanguage.googleapis.com does send CORS
+    // headers, so this is more likely DNS, an ad blocker, or offline.
+    throw new Error("Could not reach Google Gemini — check your connection, VPN, or content blocker.");
+  }
+
+  const payload = await res.json().catch(() => null) as unknown;
+
+  if (!res.ok) {
+    const e = payload as { error?: { message?: string } } | null;
+    const msg = e?.error?.message || "";
+    if (res.status === 400 && /api key/i.test(msg)) throw new Error("Gemini rejected the API key — check it in Integrations. (A Google AI Studio key is required; a Gemini subscription does not include API access.)");
+    if (res.status === 403 || res.status === 401) throw new Error("Gemini rejected the key (HTTP " + res.status + "). Check it in Integrations → AI & Automation.");
+    if (res.status === 429) throw new Error("Gemini rate limit or quota reached — wait a moment, or check your AI Studio quota.");
+    if (res.status === 404) throw new Error(`Gemini could not find model "${model.id}".`);
+    throw new Error(msg || `Gemini HTTP ${res.status}`);
+  }
+
+  const image = extractGeminiImage(payload);
+  if (!image) throw new Error(explainGeminiFailure(payload));
+
+  // atob -> bytes -> Blob keeps the same object-URL contract as the Hugging
+  // Face path, so callers need no special-casing.
+  const binary = atob(image.data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return URL.createObjectURL(new Blob([bytes], { type: image.mimeType }));
+}
+
 async function generateImageFal(apiKey: string, prompt: string): Promise<string> {
   const res = await fetch("https://fal.run/fal-ai/flux/schnell", {
     method: "POST",
@@ -1594,13 +1650,19 @@ function ContentFormPanel({ item, brands, open, onClose, onSave, apiKey, aiModel
   const huggingface = (integrations || []).find(i => i.id === "huggingface");
   const stablehorde = (integrations || []).find(i => i.id === "stablehorde");
   const groqInt     = (integrations || []).find(i => i.id === "groq");
+  const gemini      = (integrations || []).find(i => i.id === "gemini");
   const hasFal        = falai?.connected && !!falai.config.apiKey;
   const hasReplicate  = replicate?.connected && !!replicate.config.apiToken;
   const hasPollinations = !!pollinations?.connected && !!pollinations?.config.apiKey;
   const hasHuggingFace  = huggingface?.connected && !!huggingface.config.apiToken;
   const hasStableHorde  = !!stablehorde?.connected;
-  const hasMediaAI = hasPollinations || hasHuggingFace || hasStableHorde || hasFal || hasReplicate;
-  const imageProviderLabel = hasPollinations ? "Pollinations.ai" : hasHuggingFace ? "Hugging Face" : hasStableHorde ? "Stable Horde" : hasFal ? "fal.ai" : hasReplicate ? "Replicate" : null;
+  const hasGemini       = !!gemini?.connected && !!gemini?.config.apiKey;
+  const hasMediaAI = hasPollinations || hasHuggingFace || hasStableHorde || hasFal || hasReplicate || hasGemini;
+  // Gemini leads only when a key is present, so a workspace without it resolves
+  // to exactly the same provider as before. Note the tail of this label still
+  // disagrees with handleGenerateImage below (Pollinations vs Stable Horde);
+  // that mismatch predates this change and is left alone here.
+  const imageProviderLabel = hasGemini ? "Google Gemini" : hasPollinations ? "Pollinations.ai" : hasHuggingFace ? "Hugging Face" : hasStableHorde ? "Stable Horde" : hasFal ? "fal.ai" : hasReplicate ? "Replicate" : null;
 
   const contentProviderAvailable = (pid: ScheduleProviderId) => {
     if (pid === "claude")       return !!apiKey;
@@ -1694,7 +1756,8 @@ function ContentFormPanel({ item, brands, open, onClose, onSave, apiKey, aiModel
       // Keyless / no-Turnstile providers are preferred so image generation works
       // without getting blocked by Pollinations' Turnstile gate. Pollinations is
       // the fallback of last resort.
-      if (hasStableHorde)    url = await generateImageStableHorde(stablehorde!.config.apiKey, form.imagePrompt, stablehorde!.config.model, msg => setMediaProgress(msg));
+      if (hasGemini)        url = await generateImageGemini(gemini!.config.apiKey, form.imagePrompt, gemini!.config.model, gemini!.config.imageSize, form.format, msg => setMediaProgress(msg));
+      else if (hasStableHorde)    url = await generateImageStableHorde(stablehorde!.config.apiKey, form.imagePrompt, stablehorde!.config.model, msg => setMediaProgress(msg));
       else if (hasHuggingFace) url = await generateImageHuggingFace(huggingface!.config.apiToken, form.imagePrompt, huggingface!.config.model);
       else if (hasFal)         url = await generateImageFal(falai!.config.apiKey, form.imagePrompt);
       else if (hasReplicate)   url = await generateImageReplicate(replicate!.config.apiToken, form.imagePrompt);
@@ -3637,7 +3700,7 @@ function AnalyticsView({ brands, content }: { brands: Brand[]; content: ContentI
 
 // ─── Integrations ─────────────────────────────────────────────────────────────
 
-type IntegrationId = "falai" | "replicate" | "pollinations" | "huggingface" | "stablehorde" | "groq";
+type IntegrationId = "falai" | "replicate" | "pollinations" | "huggingface" | "stablehorde" | "groq" | "gemini";
 
 interface IntegrationConfig { [key: string]: string }
 
@@ -3689,6 +3752,27 @@ const INTEGRATION_DEFS: {
         { step: "Copy your token", detail: "It starts with 'hf_'. Paste it above." },
         { step: "Free tier limits", detail: "~1,000 requests/day on the free tier. FLUX.1-schnell is fast (~5s). If you hit limits, Hugging Face Pro ($9/mo) removes them." },
         { step: "Model options", detail: "Best free models: black-forest-labs/FLUX.1-schnell (fastest), stabilityai/stable-diffusion-xl-base-1.0, black-forest-labs/FLUX.1-dev (higher quality)." },
+      ],
+    },
+  },
+  {
+    id: "gemini", name: "Google Gemini", icon: "✨", color: "#4285f4", bg: "#e8f0fe",
+    category: "AI & Automation",
+    desc: "Nano Banana image generation — strong prompt understanding and legible text inside images",
+    fields: [
+      { key: "apiKey",    label: "API Key",               placeholder: "AIzaSy…", secret: true, hint: "From aistudio.google.com/apikey" },
+      { key: "model",     label: "Model (optional)",      placeholder: "gemini-3.1-flash-image", hint: "Leave blank for Nano Banana 2", optional: true },
+      { key: "imageSize", label: "Resolution (optional)", placeholder: "1K", hint: "1K, 2K or 4K — higher is slower", optional: true },
+    ],
+    guide: {
+      title: "Get a Google AI Studio API key",
+      steps: [
+        { step: "Open Google AI Studio", url: "https://aistudio.google.com/apikey", urlLabel: "aistudio.google.com/apikey" },
+        { step: "Click 'Create API key'", detail: "Sign in with the Google account that owns the project, then pick or create a project." },
+        { step: "Copy the key — it starts with AIza", detail: "It is only shown once. Paste it into the API Key field above." },
+        { step: "A Gemini subscription is not API access", detail: "Google One AI Premium unlocks Gemini in Google's consumer apps, but the API needs its own key from AI Studio. The free tier is enough to try it." },
+        { step: "Which model", detail: "Default is Nano Banana 2 (gemini-3.1-flash-image): fast and versatile. Nano Banana Pro (gemini-3-pro-image) is higher quality but slower." },
+        { step: "Billing note", detail: "Image generation is metered per image. Set a budget alert in AI Studio before a demo so a runaway prompt cannot surprise you." },
       ],
     },
   },
@@ -3830,7 +3914,25 @@ async function verifyProviderConnection(id: IntegrationId, config: IntegrationCo
         const res = await fetch("https://api.replicate.com/v1/models", { headers: { Authorization: `Token ${key}` } });
         return res.ok ? { ok: true, message: "Replicate: token is valid." } : { ok: false, message: `Replicate rejected the token (HTTP ${res.status}).` };
       }
-      default: return { ok: true, message: "Connected." };
+        case "gemini": {
+          const key = (config.apiKey || "").trim();
+          if (!key) return { ok: false, message: "Enter your Google AI Studio API key first." };
+          // Listing models validates the key and costs nothing, unlike a
+          // generate call. Also catches a mistyped model id, which is the most
+          // likely mistake on this card.
+          const res = await fetch(`${GEMINI_API_BASE}?pageSize=200`, { headers: { "x-goog-api-key": key } });
+          if (!res.ok) {
+            const e = await res.json().catch(() => ({})) as { error?: { message?: string } };
+            if (res.status === 400 || res.status === 401 || res.status === 403) return { ok: false, message: "Gemini rejected the API key. Create one at aistudio.google.com/apikey." };
+            return { ok: false, message: `Gemini check failed (HTTP ${res.status})${e.error?.message ? `: ${e.error.message}` : "."}` };
+          }
+          const data = await res.json().catch(() => ({})) as { models?: { name?: string }[] };
+          const modelId = resolveGeminiModel(config.model).id;
+          const present = (data.models || []).some(m => m.name === `models/${modelId}`);
+          if (!present) return { ok: false, message: `Gemini key is valid, but this account cannot use "${modelId}". Try leaving the model field blank for the default.` };
+          return { ok: true, message: `Gemini: key is valid, ${modelId} available.` };
+        }
+        default: return { ok: true, message: "Connected." };
     }
   } catch {
     return { ok: false, message: "Could not reach the provider — check your internet connection and try again." };
