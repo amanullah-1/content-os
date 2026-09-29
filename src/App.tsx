@@ -1211,20 +1211,39 @@ async function callGroqText(apiKey: string, model: string, prompt: string, syste
   return text;
 }
 
+// Pollinations consolidated onto a single host, gen.pollinations.ai. The old
+// text.pollinations.ai and image.pollinations.ai hosts are deprecated: the text
+// one still answers but is undocumented, and the image one now answers 402
+// (no credit) or hangs on a rate limit. Auth is a Bearer key on either the
+// Authorization header or ?key= for GETs.
+const POLLINATIONS_BASE = "https://gen.pollinations.ai";
+
+// Turns a Pollinations HTTP failure into something the user can act on. 401 is
+// a bad/missing key, 402 is an exhausted balance - they need opposite fixes.
+function pollinationsError(status: number, raw: string): Error {
+  if (status === 401) return new Error("Pollinations rejected the key (HTTP 401). Copy a current key from enter.pollinations.ai/keys - keys start with sk_ or pk_.");
+  if (status === 402) return new Error("Pollinations has no credit left on this key (HTTP 402). Add Pollen to the account, or use another provider.");
+  if (status === 429) return new Error("Pollinations rate limit (HTTP 429). Wait a moment and try again.");
+  if (status === 403) return new Error("Pollinations refused the request (HTTP 403). The key may not be allowed to use this model - check the model's scope on your key.");
+  return new Error(`Pollinations HTTP ${status}${raw ? ": " + raw.slice(0, 120) : ""}`);
+}
+
 async function callPollinationsText(apiKey: string, model: string, prompt: string, system?: string): Promise<string> {
   const messages = [
     ...(system ? [{ role: "system", content: system }] : []),
     { role: "user", content: prompt },
   ];
-  const res = await fetch("https://text.pollinations.ai/openai", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ model, messages, seed: Math.floor(Math.random() * 99999) }),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Pollinations HTTP ${res.status}${body ? ": " + body.slice(0, 120) : ""}`);
+  let res: Response;
+  try {
+    res = await fetch(`${POLLINATIONS_BASE}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, messages, seed: Math.floor(Math.random() * 99999) }),
+    });
+  } catch {
+    throw new Error("Could not reach gen.pollinations.ai from the browser - check your connection, VPN, or content blocker.");
   }
+  if (!res.ok) throw pollinationsError(res.status, await res.text().catch(() => ""));
   const data = await res.json() as { choices?: { message?: { content?: string } }[] };
   const text = data.choices?.[0]?.message?.content;
   if (!text) throw new Error("No content in Pollinations response");
@@ -1365,14 +1384,16 @@ const SCHEDULE_PROVIDERS = [
     name: "Pollinations.ai",
     icon: "🌸",
     color: "#059669",
-    desc: "Free image-focused AI — text generation via GPT-4o, Llama, Mistral with API key",
+    desc: "One Pollinations key, many models - OpenAI, Claude, Gemini and DeepSeek through one API",
     requiresKey: true,
+    // Fully-qualified ids, as listed by GET /v1/models. The old short aliases
+    // (openai, openai-large, llama, mistral, deepseek) were served by the
+    // retired text.pollinations.ai and do not exist on gen.pollinations.ai.
     models: [
-      { id: "openai",        label: "GPT-4o",        desc: "Best quality" },
-      { id: "openai-large",  label: "GPT-4o Large",  desc: "More capable" },
-      { id: "llama",         label: "Llama 3.3 70B", desc: "Open-source" },
-      { id: "mistral",       label: "Mistral",       desc: "Fast" },
-      { id: "deepseek",      label: "DeepSeek",      desc: "Strong reasoning" },
+      { id: "openai/gpt-5.4-mini",   label: "GPT-5.4 mini",   desc: "Best quality" },
+      { id: "google/gemini-3.5-flash-lite", label: "Gemini 3.5 Flash Lite", desc: "Fast, cheap" },
+      { id: "mistralai/mistral-small-4",     label: "Mistral Small 4", desc: "Open source" },
+      { id: "deepseek/deepseek-v4-flash",   label: "DeepSeek V4",   desc: "Strong reasoning" },
     ],
   },
   {
@@ -1487,27 +1508,25 @@ Return ONLY valid JSON:
 async function generateImagePollinations(apiKey: string, prompt: string, format: string): Promise<string> {
   const landscape = new Set(["Image","Carousel","Story"]);
   const [w, h] = landscape.has(format) ? [1024, 768] : [768, 1024];
-  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${w}&height=${h}&model=flux&nologo=true&enhance=true&token=${encodeURIComponent(apiKey)}&seed=${Math.floor(Math.random()*999999)}`;
-  // Pollinations gates browser requests behind a Cloudflare Turnstile check. A plain
-  // <img> load can't send a Turnstile token, so probe with fetch() first to surface a
-  // clear, actionable error instead of a bare 403 / silent pixel failure.
-  const probe = await fetch(url, { method: "HEAD", mode: "cors" }).catch(() => null);
-  if (probe && probe.status === 403) {
-    try {
-      const body = await probe.text();
-      if (body.includes("Turnstile"))
-        throw new Error("Pollinations blocked this request (needs a Turnstile token). Pollinations now rejects raw browser image calls — generate your thumbnail with Stable Horde or Hugging Face instead.");
-    } catch (e) {
-      if (e instanceof Error && e.message.startsWith("Pollinations blocked")) throw e;
-    }
+  // gen.pollinations.ai serves images from /image/{prompt}. The key goes in
+  // ?key= because an <img src> cannot set an Authorization header; we fetch the
+  // bytes with fetch() instead so a 402/401 surfaces as a real error rather
+  // than a silently broken image, and hand back a blob URL.
+  const url = `${POLLINATIONS_BASE}/image/${encodeURIComponent(prompt)}`
+    + `?model=black-forest-labs/flux.1-schnell&width=${w}&height=${h}&nologo=true&seed=${Math.floor(Math.random() * 999999)}`
+    + `&key=${encodeURIComponent(apiKey)}`;
+  let res: Response;
+  try {
+    res = await fetch(url);
+  } catch {
+    throw new Error("Could not reach gen.pollinations.ai from the browser - check your connection, VPN, or content blocker.");
   }
-  await new Promise<void>((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve();
-    img.onerror = () => reject(new Error("Pollinations image failed to load (HTTP 403 / Turnstile) — switch your image provider to Stable Horde or Hugging Face."));
-    img.src = url;
-  });
-  return url;
+  if (!res.ok) throw pollinationsError(res.status, await res.text().catch(() => ""));
+  const blob = await res.blob();
+  if (!blob.type.startsWith("image/")) {
+    throw new Error("Pollinations returned " + (blob.type || "an unknown type") + " instead of an image.");
+  }
+  return URL.createObjectURL(blob);
 }
 
 async function generateImageHuggingFace(apiToken: string, prompt: string, model?: string): Promise<string> {
@@ -1815,9 +1834,11 @@ function ContentFormPanel({ item, brands, open, onClose, onSave, apiKey, aiModel
     setMediaLoading(true); setMediaProgress("Generating image…"); setAiError(null);
     try {
       let url: string;
-      // Keyless / no-Turnstile providers are preferred so image generation works
-      // without getting blocked by Pollinations' Turnstile gate. Pollinations is
-      // the fallback of last resort.
+      // Order prefers the highest-quality provider that is actually connected.
+      // Pollinations is last because it is the only one that can return HTTP 402
+      // for a valid key with no credit left. (This used to be justified by a
+      // "Turnstile gate" — that diagnosis was wrong; the old image host was
+      // simply deprecated. The ordering still makes sense, so it stands.)
       if (hasGemini)        url = await generateImageGemini(gemini!.config.apiKey, form.imagePrompt, gemini!.config.model, gemini!.config.imageSize, form.format, msg => setMediaProgress(msg));
       else if (hasStableHorde)    url = await generateImageStableHorde(stablehorde!.config.apiKey, form.imagePrompt, stablehorde!.config.model, msg => setMediaProgress(msg));
       else if (hasHuggingFace) url = await generateImageHuggingFace(huggingface!.config.apiToken, form.imagePrompt, huggingface!.config.model);
@@ -3782,18 +3803,18 @@ const INTEGRATION_DEFS: {
   {
     id: "pollinations", name: "Pollinations.ai", icon: "🌸", color: "#059669", bg: "#ecfdf5",
     category: "AI & Automation",
-    desc: "Free image generation powered by FLUX — requires a free API key from pollinations.ai",
+    desc: "OpenAI, Claude, Gemini and DeepSeek through one key — text and FLUX images",
     fields: [
-      { key: "apiKey", label: "API Key", placeholder: "your-pollinations-api-key", secret: true, hint: "From auth.pollinations.ai" },
+      { key: "apiKey", label: "API Key", placeholder: "sk_… or pk_…", secret: true, hint: "From enter.pollinations.ai/keys" },
     ],
     guide: {
-      title: "Get your free Pollinations.ai API key",
+      title: "Get your Pollinations.ai API key",
       steps: [
-        { step: "Visit auth.pollinations.ai to get your key", url: "https://auth.pollinations.ai", urlLabel: "auth.pollinations.ai" },
-        { step: "Sign in with GitHub or Google", detail: "Pollinations uses OAuth — no password to create, just connect your existing account." },
-        { step: "Copy your API key", detail: "After signing in your API key is shown on the page. Paste it above." },
-        { step: "Free tier", detail: "The free tier gives generous image generation limits powered by FLUX. No credit card required." },
-        { step: "How it works", detail: "Your image prompt is sent to image.pollinations.ai with your key as a token parameter, returning a FLUX-generated image." },
+        { step: "Visit enter.pollinations.ai/keys", url: "https://enter.pollinations.ai/keys", urlLabel: "enter.pollinations.ai/keys" },
+        { step: "Create a key", detail: "Keys start with sk_ (secret) or pk_ (App Key). Pick the models it may use, or allow all." },
+        { step: "Copy the key and paste it above", detail: "It is only shown once. ContentOS sends it as a Bearer token to gen.pollinations.ai." },
+        { step: "Pollinations now needs credit", detail: "If a request returns HTTP 402, the key authenticated fine but has no Pollen left. Add credit at enter.pollinations.ai." },
+        { step: "How it works", detail: "Captions and scripts go to gen.pollinations.ai/v1/chat/completions; images go to gen.pollinations.ai/image with FLUX." },
       ],
     },
   },
@@ -3943,13 +3964,35 @@ async function verifyProviderConnection(id: IntegrationId, config: IntegrationCo
         const res = await fetch("https://api.groq.com/openai/v1/models", { headers: { Authorization: `Bearer ${key}` } });
         return res.ok ? { ok: true, message: "Groq: key is valid." } : { ok: false, message: `Groq rejected the key (HTTP ${res.status}).` };
       }
-      case "pollinations": {
-        const key = (config.apiKey || "").trim();
-        if (!key) return { ok: false, message: "Enter your Pollinations API key first." };
-        const probe = await fetch(`https://image.pollinations.ai/prompt/${encodeURIComponent("test")}?width=64&height=64&seed=1`, { method: "HEAD", mode: "cors" }).catch(() => null);
-        if (probe && probe.status === 403) return { ok: false, message: "Pollinations rejected the key/request (HTTP 403 — often its Turnstile gate). Use Stable Horde or Hugging Face instead." };
-        return { ok: true, message: "Pollinations: key accepted." };
-      }
+        case "pollinations": {
+          const key = (config.apiKey || "").trim();
+          if (!key) return { ok: false, message: "Enter your Pollinations API key first." };
+          // /v1/models needs no auth, so it only proves the host is reachable.
+          // The Bearer key itself is what matters, and a wrong key returns 401
+          // only once a billable endpoint is hit - /account/balance reads the
+          // key without generating anything.
+          let res: Response;
+          try {
+            res = await fetch(`${POLLINATIONS_BASE}/account/balance`, {
+              headers: { Authorization: `Bearer ${key}` },
+            });
+          } catch {
+            return { ok: false, message: "Could not reach gen.pollinations.ai from the browser - check your connection, VPN, or content blocker." };
+          }
+          if (res.ok) {
+            const bal = await res.json().catch(() => null) as { balance?: number } | null;
+            const pollen = bal?.balance;
+            return {
+              ok: true,
+              message: typeof pollen === "number"
+                ? `Pollinations: key is valid - ${Math.round(pollen)} Pollen remaining.`
+                : "Pollinations: key is valid.",
+            };
+          }
+          if (res.status === 401) return { ok: false, message: "Pollinations rejected that key. Copy a current one from enter.pollinations.ai/keys." };
+          if (res.status === 402) return { ok: false, message: "Pollinations key is valid but has no credit left (HTTP 402). Add Pollen to the account." };
+          return { ok: false, message: `Pollinations check failed (HTTP ${res.status}).` };
+        }
         case "huggingface": {
           const token = (config.apiToken || "").trim();
           if (!token) return { ok: false, message: "Enter your Hugging Face token first." };
