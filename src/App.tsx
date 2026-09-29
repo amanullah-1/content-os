@@ -1260,21 +1260,41 @@ async function callHuggingFaceText(apiToken: string, model: string, prompt: stri
   // A ":cheapest" suffix picks the least expensive provider — free accounts
   // only get $0.10 of credits a month, so this is the sensible default. If
   // that provider is unavailable, retry with the router's own choice.
+  // A failed fetch() THROWS ("NetworkError when attempting to fetch resource")
+  // instead of returning a response, so the retry and the inference fallback
+  // below were both unreachable and the user saw a raw browser string. Catch
+  // here so every failure path lands on an actionable message.
   const suffix = model.includes(":") ? "" : ":cheapest";
-  let chatRes = await chat(model + suffix);
-  if (!chatRes.ok && suffix) chatRes = await chat(model);
-  if (chatRes.ok) {
+  const attempt = async (m: string): Promise<Response | null> => {
+    try { return await chat(m); } catch { return null; }
+  };
+
+  let chatRes = await attempt(model + suffix);
+  if (chatRes && !chatRes.ok && suffix) chatRes = await attempt(model);
+  if (chatRes?.ok) {
     const data = await chatRes.json() as { choices?: { message?: { content?: string } }[] };
     const text = data.choices?.[0]?.message?.content;
     if (text) return text;
   }
+  if (chatRes === null) {
+    throw new Error(
+      "Hugging Face could not be reached from the browser. This is usually a network or " +
+      "firewall block on router.huggingface.co, or an ad/tracker blocker intercepting it. " +
+      "Check the Network tab, or generate with Gemini or Claude instead."
+    );
+  }
   // Fall back to standard inference API (older / pipeline models)
   const fullPrompt = `${system ? system + "\n\n" : ""}${messages.map(m => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`).join("\n")}\nAssistant:`;
-  const inferRes = await fetch(`${HF_INFERENCE}/models/${model}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ inputs: fullPrompt, parameters: { max_new_tokens: 8000, return_full_text: false } }),
-  });
+  let inferRes: Response;
+  try {
+    inferRes = await fetch(`${HF_INFERENCE}/models/${model}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ inputs: fullPrompt, parameters: { max_new_tokens: 8000, return_full_text: false } }),
+    });
+  } catch {
+    throw new Error("Hugging Face rejected the request at the network layer — the host could not be reached from this browser.");
+  }
   if (!inferRes.ok) {
     const e = await inferRes.json().catch(() => ({})) as { error?: string };
     if (e.error?.includes("loading")) throw new Error("Model is loading on Hugging Face — wait ~30s and try again.");
@@ -3930,13 +3950,18 @@ async function verifyProviderConnection(id: IntegrationId, config: IntegrationCo
         if (probe && probe.status === 403) return { ok: false, message: "Pollinations rejected the key/request (HTTP 403 — often its Turnstile gate). Use Stable Horde or Hugging Face instead." };
         return { ok: true, message: "Pollinations: key accepted." };
       }
-      case "huggingface": {
-        const token = (config.apiToken || "").trim();
-        if (!token) return { ok: false, message: "Enter your Hugging Face token first." };
-        const res = await fetch("https://huggingface.co/api/whoami-v2", { headers: { Authorization: `Bearer ${token}` } });
-        if (res.ok) return { ok: true, message: "Hugging Face: token is valid." };
-        return { ok: false, message: `Hugging Face rejected the token (HTTP ${res.status}).` };
-      }
+        case "huggingface": {
+          const token = (config.apiToken || "").trim();
+          if (!token) return { ok: false, message: "Enter your Hugging Face token first." };
+          let res: Response;
+          try {
+            res = await fetch("https://huggingface.co/api/whoami-v2", { headers: { Authorization: `Bearer ${token}` } });
+          } catch {
+            return { ok: false, message: "Could not reach huggingface.co from the browser - check your connection, VPN, or content blocker." };
+          }
+          if (res.ok) return { ok: true, message: "Hugging Face: token is valid." };
+          return { ok: false, message: `Hugging Face rejected the token (HTTP ${res.status}).` };
+        }
       case "stablehorde": {
         const key = (config.apiKey || "").trim() || "0000000000";
         const res = await fetch(`https://stablehorde.net/api/v2/users/${key}`, { headers: key === "0000000000" ? {} : { apikey: key } });
