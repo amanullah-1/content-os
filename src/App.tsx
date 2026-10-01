@@ -1224,7 +1224,7 @@ function pollinationsError(status: number, raw: string): Error {
   if (status === 401) return new Error("Pollinations rejected the key (HTTP 401). Copy a current key from enter.pollinations.ai/keys - keys start with sk_ or pk_.");
   if (status === 402) return new Error("Pollinations has no credit left on this key (HTTP 402). Add Pollen to the account, or use another provider.");
   if (status === 429) return new Error("Pollinations rate limit (HTTP 429). Wait a moment and try again.");
-  if (status === 403) return new Error("Pollinations refused the request (HTTP 403). The key may not be allowed to use this model - check the model's scope on your key.");
+  if (status === 403) return new Error("Cloudflare refused this request from your browser (HTTP 403). Pollinations' own auth does not use 403 - this is a content blocker, VPN, or bot check. Disable it for this site, or use another provider.");
   return new Error(`Pollinations HTTP ${status}${raw ? ": " + raw.slice(0, 120) : ""}`);
 }
 
@@ -3967,17 +3967,33 @@ async function verifyProviderConnection(id: IntegrationId, config: IntegrationCo
         case "pollinations": {
           const key = (config.apiKey || "").trim();
           if (!key) return { ok: false, message: "Enter your Pollinations API key first." };
-          // /v1/models needs no auth, so it only proves the host is reachable.
-          // The Bearer key itself is what matters, and a wrong key returns 401
-          // only once a billable endpoint is hit - /account/balance reads the
-          // key without generating anything.
+          // Two-step, because a 403 here is ambiguous: Pollinations' own auth
+          // layer only ever answers 401 (bad key) or 402 (valid key, no credit),
+          // so a 403 is Cloudflare refusing the browser request itself - a
+          // content blocker, VPN, or bot scoring on a localhost origin.
+          //
+          // 1. /v1/models needs no auth, so it separates "host is blocked" from
+          //    "key is bad". It is confirmed to return 200 even with a bogus key.
+          // 2. Only if that passes do we read the key with /account/balance.
+          try {
+            const ping = await fetch(`${POLLINATIONS_BASE}/v1/models`, { method: "GET" });
+            if (!ping.ok) {
+              if (ping.status === 403) {
+                return { ok: false, message: "Cloudflare blocked this browser from reaching Pollinations (HTTP 403). Disable your ad/tracker blocker or VPN for this site, then retry. The key is probably fine." };
+              }
+              return { ok: false, message: `Could not reach Pollinations (HTTP ${ping.status}). Try again shortly.` };
+            }
+          } catch {
+            return { ok: false, message: "Could not reach gen.pollinations.ai from the browser - check your connection, VPN, or content blocker." };
+          }
+
           let res: Response;
           try {
             res = await fetch(`${POLLINATIONS_BASE}/account/balance`, {
               headers: { Authorization: `Bearer ${key}` },
             });
           } catch {
-            return { ok: false, message: "Could not reach gen.pollinations.ai from the browser - check your connection, VPN, or content blocker." };
+            return { ok: false, message: "The network dropped while checking the key. Try again." };
           }
           if (res.ok) {
             const bal = await res.json().catch(() => null) as { balance?: number } | null;
@@ -3989,8 +4005,9 @@ async function verifyProviderConnection(id: IntegrationId, config: IntegrationCo
                 : "Pollinations: key is valid.",
             };
           }
-          if (res.status === 401) return { ok: false, message: "Pollinations rejected that key. Copy a current one from enter.pollinations.ai/keys." };
-          if (res.status === 402) return { ok: false, message: "Pollinations key is valid but has no credit left (HTTP 402). Add Pollen to the account." };
+          if (res.status === 401) return { ok: false, message: "Pollinations rejected that key. Copy a current one from enter.pollinations.ai/keys - keys start with sk_ or pk_." };
+          if (res.status === 402) return { ok: false, message: "Pollinations key is valid but has no credit left (HTTP 402). Add Pollen at enter.pollinations.ai, or pick another provider." };
+          if (res.status === 403) return { ok: false, message: "Cloudflare refused the key check (HTTP 403) even though the host is reachable. Disable your ad/tracker blocker or VPN for this site and retry." };
           return { ok: false, message: `Pollinations check failed (HTTP ${res.status}).` };
         }
         case "huggingface": {
