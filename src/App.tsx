@@ -3995,6 +3995,24 @@ async function verifyProviderConnection(id: IntegrationId, config: IntegrationCo
           } catch {
             return { ok: false, message: "The network dropped while checking the key. Try again." };
           }
+          // Some networks (Cloudflare WAF rules, corporate proxies) refuse
+          // /account/* while leaving generation endpoints reachable. Fall back to
+          // a 1-token chat completion, which validates the same key and is not
+          // behind that path. It costs a fraction of a pollen and confirms auth.
+          if (res.status === 403) {
+            try {
+              const probe = await fetch(`${POLLINATIONS_BASE}/v1/chat/completions`, {
+                method: "POST",
+                headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+                body: JSON.stringify({ model: "openai/gpt-5.4-mini", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+              });
+              if (probe.ok) return { ok: true, message: "Pollinations: key is valid. (The balance endpoint is blocked on your network, so Pollen could not be read.)" };
+              if (probe.status === 401) return { ok: false, message: "Pollinations rejected that key. Copy a current one from enter.pollinations.ai/keys - keys start with sk_ or pk_." };
+              if (probe.status === 402) return { ok: false, message: "Pollinations key is valid but has no credit left (HTTP 402). Add Pollen at enter.pollinations.ai, or pick another provider." };
+            } catch {
+              return { ok: false, message: "Could not reach Pollinations to finish checking the key - check your connection, VPN, or content blocker." };
+            }
+          }
           if (res.ok) {
             const bal = await res.json().catch(() => null) as { balance?: number } | null;
             const pollen = bal?.balance;
@@ -4007,7 +4025,7 @@ async function verifyProviderConnection(id: IntegrationId, config: IntegrationCo
           }
           if (res.status === 401) return { ok: false, message: "Pollinations rejected that key. Copy a current one from enter.pollinations.ai/keys - keys start with sk_ or pk_." };
           if (res.status === 402) return { ok: false, message: "Pollinations key is valid but has no credit left (HTTP 402). Add Pollen at enter.pollinations.ai, or pick another provider." };
-          if (res.status === 403) return { ok: false, message: "Cloudflare refused the key check (HTTP 403) even though the host is reachable. Disable your ad/tracker blocker or VPN for this site and retry." };
+          if (res.status === 403) return { ok: false, message: "Your network is blocking Pollinations' account endpoints (HTTP 403). This is a content blocker or corporate proxy, not a key problem - Gemini works without it." };
           return { ok: false, message: `Pollinations check failed (HTTP ${res.status}).` };
         }
         case "huggingface": {
